@@ -1,0 +1,347 @@
+"""Routing extension points a project's config uses for its own language, and the
+subagent hook's safety rules (ADR-025 addendum, subagent routing plan R1).
+
+The engine stays language-agnostic: every non-English word below comes from
+config in the test, never from the engine."""
+import io
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import core.routing as routing
+from core import executions, hooks
+from core.routing import classify, config, evaluate, policy, registry, score
+from core.routing.types import LEVELS, TASK_TYPES, TaskClass, normalise
+
+REPO = Path(__file__).resolve().parents[1]
+EOS = [sys.executable, str(REPO / "core" / "eos.py")]
+
+
+def _project(tmp_path, table: str = "") -> Path:
+    root = tmp_path / "proj"
+    root.mkdir()
+    assert subprocess.run(EOS + ["init", str(root), "--no-ai"], capture_output=True).returncode == 0
+    if table:
+        path = root / ".eos" / "config.toml"
+        path.write_text(path.read_text(encoding="utf-8") + "\n" + table, encoding="utf-8")
+    return root
+
+
+# --- normalisation and stems -------------------------------------------------------
+
+
+def test_the_dotted_capital_i_lowers_to_a_plain_i():
+    assert normalise("İPTAL  İşlemi") == "iptal işlemi"
+    assert normalise("Implement IT") == "implement it", "the dotless capital still lowers to i"
+
+
+def test_a_stem_matches_every_word_it_starts_and_nothing_inside_a_word():
+    assert classify.matches("hataları düzeltelim", "hata*")
+    assert classify.matches("hata", "hata*")
+    assert not classify.matches("mühata", "hata*")
+    assert classify.matches("yeniden düzenleyelim", "yeniden düzenle*")
+
+
+def test_built_in_tables_keep_their_english_inflections():
+    assert classify.matches("fixed the crash", "fix")
+    assert not classify.matches("prefix", "fix")
+
+
+@pytest.mark.parametrize("table, message", [
+    ('[model_routing.keywords]\ndebugging = ["ha*"]\n', "shorter than"),
+    ('[model_routing.keywords]\ndebugging = ["h*ta"]\n', "may only end"),
+    ('[model_routing.rules]\nopeners = ["neden"]\n', "unknown rule list"),
+    ('[model_routing.factors]\nmoney = ["para*"]\n', "unknown factor"),
+    ('[model_routing]\nhook_min_confidence = 1.5\n', "from 0 to 1"),
+])
+def test_a_malformed_table_is_refused_with_its_key(tmp_path, table, message):
+    with pytest.raises(ValueError, match=message):
+        config.load(_project(tmp_path, table))
+
+
+# --- config extends, never replaces ---------------------------------------------------
+
+
+def test_config_keywords_classify_another_language(tmp_path):
+    root = _project(tmp_path, '[model_routing.keywords]\ndebugging = ["hata*", "düzelt*"]\n')
+    cfg = config.load(root)
+    assert classify.classify("ödeme ekranındaki hataları düzeltelim", cfg.keywords, cfg.rules).type == "debugging"
+    # English still classifies as it did
+    assert classify.classify("fix the crash when saving a draft", cfg.keywords, cfg.rules).type == "debugging"
+
+
+def test_rule_lists_extend_the_built_in_rules(tmp_path):
+    """Rules act on a task some keyword classified, as the built-in ones always
+    have: a prompt no table recognises stays normal_implementation."""
+    root = _project(tmp_path, '[model_routing.keywords]\nnormal_implementation = ["güncelle*"]\n'
+                              'debugging = ["kırmızı"]\n'
+                              '[model_routing.rules]\nrepository_wide = ["tüm servislerde"]\n'
+                              'question_openers = ["neden"]\n')
+    cfg = config.load(root)
+    assert classify.classify("tüm servislerde logback güncelle", cfg.keywords, cfg.rules).type \
+        == "repository_wide_change"
+    assert classify.classify("neden kırmızı", cfg.keywords, cfg.rules).type == "investigation"
+    assert classify.classify("why does the build fail", cfg.keywords, cfg.rules).type == "investigation"
+    assert classify.classify("tüm servislerde bak", {}, {}).type == "normal_implementation"
+
+
+def test_factor_words_extend_the_built_in_factors():
+    task = TaskClass("normal_implementation", 0.9, ())
+    plain = score.score("ödeme adımını ekle", task)
+    extended = score.score("ödeme adımını ekle", task, factor_words={"risk": ("ödeme*",)})
+    assert plain.factors["failure_risk"] == 0.0 and extended.factors["failure_risk"] == 0.4
+    assert score.score("payment step", task).factors["failure_risk"] == 0.4
+
+
+def test_without_the_new_tables_every_decision_is_unchanged(tmp_path):
+    corpus = REPO / "evals" / "routing" / "corpus.tsv"
+    bare, extended = _project(tmp_path), tmp_path / "other"
+    extended.mkdir()
+    assert subprocess.run(EOS + ["init", str(extended), "--no-ai"], capture_output=True).returncode == 0
+    cfg = extended / ".eos" / "config.toml"
+    cfg.write_text(cfg.read_text() + '\n[model_routing.rules]\nquestion_openers = ["zzqx"]\n', encoding="utf-8")
+    for row in evaluate.load(corpus):
+        a = routing.route(bare, row["prompt"], record=False, fresh=True)
+        b = routing.route(extended, row["prompt"], record=False, fresh=True)
+        assert (a.task_type, a.level, a.model, a.effort) == (b.task_type, b.level, b.model, b.effort), row
+
+
+# --- the safety invariant ---------------------------------------------------------------
+
+
+def test_critical_never_lands_on_the_cheapest_model_by_policy():
+    models = registry.from_entries(registry.DEFAULT_MODELS, {})
+    for task_type in TASK_TYPES:
+        for effort in ("auto", "low", "max"):
+            decision = policy.decide(TaskClass(task_type, 0.9, ()), score.Complexity(0.9, "CRITICAL", {}),
+                                     models, effort=effort, effort_source="flag" if effort != "auto" else "auto")
+            assert decision.model != "haiku" and policy.meets(models.get(decision.model), "CRITICAL", task_type)
+
+
+def test_an_override_below_the_requirement_is_never_applied(tmp_path):
+    root = _project(tmp_path, '[model_routing]\nhook = true\nhook_dry_run = false\ndefault_model = "haiku"\n')
+    cfg = config.load(root)
+    decision = routing.route(root, "design the multi tenant architecture across every service",
+                             record=False, fresh=True)
+    assert decision.model == "haiku" and decision.level in ("HIGH", "CRITICAL")
+    assert "below what" in routing.withheld(decision, cfg, registry.load(root, cfg))
+
+
+def test_withheld_rules_in_order(tmp_path):
+    root = _project(tmp_path, '[model_routing]\nhook = true\nhook_dry_run = false\nhook_min_confidence = 0.6\n')
+    cfg = config.load(root)
+    models = registry.load(root, cfg)
+    decision = routing.route(root, "fix the typo in the readme", record=False, fresh=True)
+    low = decision.__class__(**{**decision.to_dict(), "confidence": 0.59, "alternatives": ()})
+    high = decision.__class__(**{**decision.to_dict(), "confidence": 0.6, "alternatives": ()})
+    assert routing.withheld(low, cfg, models).startswith("confidence 0.59 below 0.60")
+    assert routing.withheld(high, cfg, models) is None
+    dry = config.parse({"hook": True, "hook_min_confidence": 0.0})
+    assert routing.withheld(high, dry, models) == "dry run"
+
+
+# --- the hook, live -----------------------------------------------------------------------
+
+
+def _pre_agent(root, monkeypatch, capsys, prompt, tool_use_id):
+    payload = {"session_id": "s1", "cwd": str(root), "tool_name": "Agent", "tool_use_id": tool_use_id,
+               "tool_input": {"prompt": prompt, "subagent_type": ""}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert hooks.main(["pre-agent"]) == 0
+    return capsys.readouterr().out
+
+
+def test_below_the_floor_the_call_goes_ahead_untouched_and_is_recorded(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("EOS_STATE_DIR", str(tmp_path / "state"))
+    root = _project(tmp_path, '[model_routing]\nhook = true\nhook_dry_run = false\nhook_min_confidence = 0.99\n')
+    executions.start(root, "a run", session="s1")
+    assert _pre_agent(root, monkeypatch, capsys, "fix the typo in the readme", "t1") == ""
+    [event] = [e for e in executions.load(root)[0].events if e.kind == "decided"]
+    assert event.body.startswith("not applied, confidence") and event.tool_use_id == "route:t1"
+    assert event.ref.startswith("route:") and "fix the typo" not in executions.path_for(root).read_text()
+
+
+def test_at_or_above_the_floor_the_model_is_applied_and_recorded(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("EOS_STATE_DIR", str(tmp_path / "state"))
+    root = _project(tmp_path, '[model_routing]\nhook = true\nhook_dry_run = false\nhook_min_confidence = 0.0\n')
+    executions.start(root, "a run", session="s1")
+    out = _pre_agent(root, monkeypatch, capsys, "design the service boundary for billing", "t2")
+    assert json.loads(out)["hookSpecificOutput"]["updatedInput"]["model"] in hooks.SUBAGENT_MODELS
+    [event] = [e for e in executions.load(root)[0].events if e.kind == "decided"]
+    assert event.body.startswith("applied:") and "confidence" in event.body
+
+
+# --- evaluation: splits and the gate -----------------------------------------------------
+
+
+def _corpus(tmp_path, rows):
+    path = tmp_path / "corpus.tsv"
+    path.write_text("prompt\ttype\tlevel\tmodel\tsplit\n" + "".join("\t".join(r) + "\n" for r in rows),
+                    encoding="utf-8")
+    return path
+
+
+def test_the_same_prompt_in_dev_and_test_is_refused(tmp_path):
+    path = _corpus(tmp_path, [("fix it", "", "", "haiku", "dev"), ("Fix  it", "", "", "haiku", "test")])
+    with pytest.raises(ValueError, match="both dev and test"):
+        evaluate.load(path)
+
+
+def test_test_split_prints_no_rows_and_is_recorded(tmp_path):
+    root = _project(tmp_path, "[model_routing]\n")
+    path = _corpus(tmp_path, [("fix the typo in the readme", "trivial_edit", "LOW", "haiku", "dev"),
+                              ("design the billing architecture", "architecture", "CRITICAL", "opus", "test")])
+    dev = subprocess.run(EOS + ["route", str(root), "--eval", str(path), "--split", "dev", "--json"],
+                         capture_output=True, text=True)
+    test = subprocess.run(EOS + ["route", str(root), "--eval", str(path), "--split", "test", "--json"],
+                          capture_output=True, text=True)
+    dev_result, test_result = json.loads(dev.stdout), json.loads(test.stdout)
+    assert dev_result["prompts"] == 1 and test_result["prompts"] == 1
+    assert test_result["misses"] == [] and test_result["suggested_words"] == []
+    assert (root / ".eos" / "data" / "routing-eval.jsonl").read_text().count("\n") == 1
+    assert {dev.returncode, test.returncode} <= {0, 1}
+    assert test.returncode == (0 if test_result["gate"]["pass"] else 1)
+
+
+# --- L5: a routing configuration is accepted with a receipt -------------------------
+
+
+def _config_hash(tmp_path, name, table):
+    root = tmp_path / name
+    root.mkdir()
+    assert subprocess.run(EOS + ["init", str(root), "--no-ai"], capture_output=True).returncode == 0
+    path = root / ".eos" / "config.toml"
+    path.write_text(path.read_text(encoding="utf-8") + "\n" + table, encoding="utf-8")
+    return evaluate.config_hash(root)
+
+
+def test_every_decision_changing_key_is_in_the_config_hash(tmp_path):
+    bare = _config_hash(tmp_path, "a", "[model_routing]\n")
+    assert _config_hash(tmp_path, "b", '[model_routing]\ndefault_task_type = "normal_implementation"\n') == bare
+    assert _config_hash(tmp_path, "c", '[model_routing]\nhook = true\nbrief = "always"\n') == bare
+    changed = {_config_hash(tmp_path, "d", '[model_routing]\ndefault_task_type = "investigation"\n'),
+               _config_hash(tmp_path, "e", '[model_routing]\ndefault_model = "opus"\n'),
+               _config_hash(tmp_path, "f", '[model_routing]\ndefault_effort = "high"\n')}
+    assert bare not in changed and len(changed) == 3
+
+
+def test_a_test_measurement_records_its_engine_and_corpus(tmp_path):
+    root = _project(tmp_path, "[model_routing]\n")
+    path = _corpus(tmp_path, [("design the billing architecture", "", "", "opus", "test")])
+    subprocess.run(EOS + ["route", str(root), "--eval", str(path), "--split", "test"], capture_output=True)
+    entry = json.loads((root / ".eos" / "data" / "routing-eval.jsonl").read_text().splitlines()[0])
+    version = (REPO / "core" / "VERSION").read_text().strip()
+    assert entry["engine"] == version and entry["corpus_name"] == "corpus.tsv"
+    assert entry["config"] == evaluate.config_hash(root)
+
+
+def test_doctor_warns_while_a_custom_routing_config_has_no_receipt(tmp_path):
+    def doctor(root):
+        done = subprocess.run(EOS + ["doctor", str(root)], capture_output=True, text=True)
+        assert done.returncode == 0
+        return done.stdout
+
+    plain = _project(tmp_path, "[model_routing]\nhook = true\n")
+    assert "receipt" not in doctor(plain), "the engine's own policy needs no project receipt"
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    assert subprocess.run(EOS + ["init", str(custom), "--no-ai"], capture_output=True).returncode == 0
+    config_file = custom / ".eos" / "config.toml"
+    config_file.write_text(config_file.read_text(encoding="utf-8")
+                           + '\n[model_routing]\n\n[model_routing.keywords]\ninvestigation = ["neden"]\n',
+                           encoding="utf-8")
+    assert "no receipt" in doctor(custom)
+    path = _corpus(tmp_path, [("design the billing architecture", "", "", "opus", "test")])
+    subprocess.run(EOS + ["route", str(custom), "--eval", str(path), "--split", "dev"], capture_output=True)
+    assert "no receipt" in doctor(custom), "a dev measurement is tuning, not a receipt"
+    subprocess.run(EOS + ["route", str(custom), "--eval", str(path), "--split", "test"], capture_output=True)
+    assert "no receipt" not in doctor(custom)
+    config_file.write_text(config_file.read_text(encoding="utf-8").replace('["neden"]', '["neden", "nasıl"]'),
+                           encoding="utf-8")
+    assert "no receipt" in doctor(custom), "a changed config needs its own receipt"
+
+
+def test_a_damaged_ledger_line_neither_breaks_doctor_nor_hides_a_receipt(tmp_path):
+    root = _project(tmp_path, '[model_routing]\n\n[model_routing.keywords]\ninvestigation = ["neden"]\n')
+    ledger = root / ".eos" / "data" / "routing-eval.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    good = json.dumps({"config": evaluate.config_hash(root)})
+    ledger.write_bytes(b'{"config": "\xff\xfe broken\n' + good.encode("utf-8") + b"\n")
+    done = subprocess.run(EOS + ["doctor", str(root)], capture_output=True, text=True)
+    assert done.returncode == 0 and "Traceback" not in done.stderr
+    assert "no receipt" not in done.stdout
+
+
+def test_the_test_split_is_refused_while_a_label_is_pending_review(tmp_path):
+    root = _project(tmp_path, "[model_routing]\n")
+    path = tmp_path / "corpus.tsv"
+    path.write_text("prompt\tmodel\tsplit\treview\nfix the typo\thaiku\tdev\tpending\n"
+                    "design the billing architecture\topus\ttest\tpending\n", encoding="utf-8")
+    assert evaluate.run(root, evaluate.load(path), split="dev")["prompts"] == 1
+    with pytest.raises(ValueError, match="review=pending"):
+        evaluate.run(root, evaluate.load(path), split="test")
+    test = subprocess.run(EOS + ["route", str(root), "--eval", str(path), "--split", "test"],
+                          capture_output=True, text=True)
+    assert test.returncode == 2 and not (root / ".eos" / "data" / "routing-eval.jsonl").exists()
+
+
+def test_gate_counts_under_routing_and_critical_on_the_cheapest(tmp_path):
+    root = _project(tmp_path, '[model_routing]\ndefault_model = "haiku"\n')
+    path = _corpus(tmp_path, [("design the billing architecture", "", "CRITICAL", "opus", ""),
+                              ("plan the migration", "", "HIGH", "sonnet|opus", "")])
+    result = evaluate.run(root, evaluate.load(path))
+    assert result["critical_to_cheapest"]["count"] == 1
+    assert result["under_routing"] == {"rate": 1.0, "count": 2, "high_or_critical": 2}
+    assert result["gate"]["pass"] is False and result["gate"]["thresholds"]["model_accuracy_min"] == 0.85
+
+
+def test_a_slow_policy_fails_the_latency_gate(tmp_path, monkeypatch):
+    import time
+
+    import core.routing as routing
+
+    root = _project(tmp_path, "[model_routing]\n")
+    path = _corpus(tmp_path, [("design the billing architecture", "", "", "opus", "")])
+    fast = evaluate.run(root, evaluate.load(path))
+    assert fast["gate"]["checks"]["latency_p95"] is (fast["latency_ms"]["p95"] <= 10)
+    original = routing.route
+
+    def slow(*args, **kwargs):
+        time.sleep(0.015)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "route", slow)
+    result = evaluate.run(root, evaluate.load(path))
+    assert result["latency_ms"]["p95"] >= 15
+    assert result["gate"]["checks"]["latency_p95"] is False and result["gate"]["pass"] is False
+    assert result["gate"]["thresholds"]["latency_p95_ms_max"] == 10
+    assert "latency" in evaluate.render(result)
+
+
+def test_accuracy_is_reported_per_labelled_type(tmp_path):
+    root = _project(tmp_path, "[model_routing]\n")
+    path = _corpus(tmp_path, [("design the billing architecture", "architecture", "", "opus", ""),
+                              ("fix the typo in the readme", "architecture", "", "haiku", ""),
+                              ("rename the variable", "", "", "haiku", "")])
+    result = evaluate.run(root, evaluate.load(path))
+    by_type = result["by_type"]
+    assert set(by_type) == {"architecture"}
+    assert by_type["architecture"]["prompts"] == 2 and by_type["architecture"]["type"] == 0.5
+    assert "architecture" in evaluate.render(result)
+
+
+def test_a_miss_is_listed_whether_or_not_its_type_is_labelled(tmp_path):
+    root = _project(tmp_path, "[model_routing]\n")
+    path = _corpus(tmp_path, [("design the billing architecture", "trivial_edit", "", "haiku", ""),
+                              ("rename the variable", "", "", "*", "")])
+    result = evaluate.run(root, evaluate.load(path))
+    assert [miss["prompt"] for miss in result["misses"]] == ["design the billing architecture"]
+    assert result["by_type"]["trivial_edit"]["type"] == 0.0
+
+
+def test_the_latency_gate_compares_the_unrounded_p95():
+    assert evaluate._latency_ok([10.04]) is False
+    assert evaluate._latency_ok([10.0]) is True

@@ -1,0 +1,196 @@
+---
+name: eos
+description: Load when a question needs project-wide facts EOS already indexed — where a symbol lives, what a file affects, what earlier sessions learned — and you want to weigh an EOS tool against a plain Read or Grep before reaching for either.
+---
+
+# EOS (engine {{VERSION}})
+
+EOS indexes this project into `.eos/data/eos.db`: parsed symbols, imports, a
+project graph, git history, and notes an agent chose to record. It is
+read-only except for `add_note`. `eos scan` refreshes the index; if an answer
+looks wrong, a stale index is the first thing to suspect.
+
+## What follows is decision support, not a rulebook
+
+Every command below is described with what it answers and roughly what it
+costs. None of it is a permission list. `Read`, `Grep` and `Glob` are
+frequently the cheaper way to the same fact, and this file says so per entry
+rather than pretending otherwise. Decide per question; a command being
+available is not a reason to run it.
+
+## What is not a judgement call
+
+Everything else here competes with a `Read` you can do without asking, and
+frequently loses. These do not, because nothing else produces what they hold:
+
+- **`eos brief .`** at the start — what another session is doing right now,
+  runs left open, and which notes match this branch. A SessionStart hook runs
+  it for you where one is installed.
+- **`eos brief . --task "…"`** when you are given a task — the procedure this
+  project follows for it, the last runs of it and what the failed ones taught.
+  A prompt hook runs it for you where one is installed, and prints nothing when
+  nothing is recorded.
+- **`eos run start` … `eos run finish`** around a task someone will ask about
+  later, and **`eos note add` / `eos procedure new`** for what you learned — a
+  run that is not recorded, and a lesson that lives only in this conversation,
+  are paid for again by the next session.
+- **The project's wrappers** — where the project declares them
+  (`capabilities.toml`), the task brief names the ones a task calls for and
+  **`eos capabilities .`** lists them all. Use the wrapper rather than the raw
+  command it covers: it keeps the output small, applies the project's safety
+  checks and records the call on your run. A raw command a wrapper covers is
+  recorded as a bypass, and the hook says which wrapper to use once.
+- **The `ROUTE` line** in a task brief, where the project turned routing on —
+  the model and effort this project's policy picks for the task. Use the model
+  for subagents you spawn for it, set the effort it names where you can, and
+  keep an explicit choice the user made. **`eos route . "<task>"`** prints the
+  full decision with its factors (cost: low; nothing else holds the policy).
+
+<!-- eos:mcp-only:begin -->
+## The 10 tools (this project chose the MCP surface)
+
+MCP is the exception surface here: everything below also exists as a CLI
+command, which costs nothing until it is run.
+
+| Tool | What it answers | Rough cost | Cheaper alternative |
+|---|---|---|---|
+| `get_project` | Project name, detected stack, entry points | low | reading `.eos/config.toml` yourself |
+| `get_structure` | Bounded list of project files | low–medium | **Glob** — same information, no round trip |
+| `get_file` | Contents of one project-relative file; with `terms`, its outline and only the line spans those words hit | same as the file; with `terms` about 1,200 characters | **Read** — identical bytes without `terms`; with an `offset` when you already know the lines |
+| `find_symbol` | Where a name is defined, across the whole index | low–medium | **Grep** — usually just as fast, and exact when you know the string |
+| `impact_analysis` | What a file reaches and what reaches it, to `depth` hops; `include` adds provenance, detector coverage and the file's commits | medium | **Grep** for the import string, if the project is small enough that this is quick by hand |
+| `get_context` | Project context; pass `task` to rank notes against it and `target` to anchor on a file; add `route: true` for the model and effort this project's policy picks for the task. Over MCP it returns; the CLI `eos context` **writes** `.eos/data/brain/llm_context.md` unless you pass `--stdout` | medium | **Read** the files it summarizes, when you only need one or two of them |
+| `search_index` | Full-text search over notes, brain documents and index extensions | low | `search_notes`, when you only want authored findings |
+| `get_parent_implementation` | Real source from a linked parent project, by symbol | low–medium | doing it by hand when the parent's names differ from this project's, which is the case it exists for |
+| `search_notes` | What an earlier session already learned about this | low | nothing else holds this — it is not derivable by rescanning |
+| `add_note` | Records a durable finding so the next scan doesn't lose it | low | nothing else does this either |
+
+Two channels cost nothing until a person uses them: the resources
+`@eos:eos://brief` and `@eos:eos://capabilities`, and the prompt
+`/mcp__eos__brief <task>`.
+
+One habit worth forming: when `impact_analysis` comes back with less than you
+expected, ask for `include: ["coverage"]` before concluding there is nothing
+there. It reports what each detector was asked about, so "this file has no
+dependents" and "nothing here looks for that kind of dependency" stop reading
+the same.
+
+The whole generated graph is not a tool: on a project of any real size it is
+larger than what fits usefully in a conversation. `eos graph <project>
+--output <file>` exports it for a program to filter.
+<!-- eos:mcp-only:end -->
+
+## The commands
+
+`<project>` is a **path**, not a project name, and it comes before the
+command's own arguments: `eos <command> <project> [arguments]`. Inside the
+project, that path is `.` — `eos rules .`, `eos why . <file>`,
+`eos ask . <question> [value]`. Passing the project's name instead appends it
+to the working directory and fails with "No .eos directory found at
+.../<name>/<name>", which reads like a broken tool rather than a wrong
+argument. Every command takes `--format json`.
+
+| Command | What it answers | When it earns its cost |
+|---|---|---|
+| `eos brief` | What is in flight here and which notes match this branch | At the start of a session, before reading anything |
+| `eos brief --task "…"` | For the task you were just given: the procedure recorded for it (steps, success criteria, run counts), its last runs with outcomes and lessons, the nearest notes — under 1,500 tokens. A prompt hook runs it for you and prints nothing when nothing is recorded | Before the first action of a task; follow a recorded procedure rather than improvising one, and read the last failure's lesson before repeating it |
+| `eos capabilities [--for "…"] [--command "…"]` | The wrappers this project offers instead of raw commands, the ones a task calls for, or whether a command line is the raw form one of them covers | Before reaching for `curl`, a database client or a build tool directly |
+| `eos route "…" [--file F] [--json]` | The model and effort this project's policy picks for a task, with its type, level, seven factors and reason; inside an open run the first decision is reused. Advice only — EOS calls no model | When the brief's ROUTE line is not enough: to see why, to pass the files the task touches, or to fix a model or effort with `--model` / `--effort` |
+| `eos work list [--across]` | Every item in flight, who holds it, what is stale or contested; `--across` covers sibling projects sharing one knowledge root | When picking up work, and before starting something someone may already hold |
+| `eos work add --title "…" --claim` | Records that you took this, so a parallel session sees it | The moment you start, not the moment you finish |
+| `eos work show <id>` | One item's whole history, and the commits naming its ticket | When a claim looks stale, or done and unproven |
+| `eos run start --title "…"` / `eos run finish --outcome ok\|failed\|abandoned` | Opens and closes an execution: the record of what this session *did*, which wrappers fill with events on their own (`eos run event`, or `eos-event` from a shell). A `failed` finish needs `--lesson "…"` and writes it as a `lesson` note linked to the run; `eos verify` inside an open run lands on its timeline | Start before the first action of a task you will be asked about later; finish when it is done or given up |
+| `eos decide --claim "…" [--evidence ID …] [--check CMD]` / `eos decide --resolve D-ID --evidence ID …` / `eos decide --open` | Records a decision in the open run with the ledger event ids that back it: `evidenced` when every id is a recorded tool event of this work item, otherwise `assumption` with one `reason=` line per refusal; `--resolve` closes an assumption (exit 3 while it stays one); `--open` lists the open ones. Approval is the user's alone and has no flag | When you act on a claim you did not just observe, or must tell the user what you assumed |
+| `eos why-did [path] <run-id\|work-item-id\|ticket-key> [--grep WORDS]` | Lists the decisions of that run, work item or ticket in time order, each with the ledger events cited as evidence and whether the raw output they fingerprinted is still there (`present (sha ok)`, `present (sha differs)`, `gone`, `-`); read-only | When asked "why did you do that", or before repeating a past decision |
+| `eos report [path] [--since TIME] [--format json]` | Three sections: runs proven done with their evidence ids (a run only claimed is counted, never listed), parked items with their condition, and questions only the user can answer. Default window: since the last report shown here; read-only, it does not move that mark | When asked what happened while the user was away; a session start or a user prompt prints it when something is new |
+| `eos procedure list` / `eos procedure show <slug>` | How a recurring task is done here: ordered steps, the tools they use, what proves success, how many runs went ok or failed and when it was last verified | Before doing a task the project has done before — follow the recorded steps rather than improvising plausible ones |
+| `eos procedure new --title "…" --step "…"` | Writes a procedure note (`kind: procedure`); counters then move only when a run naming it finishes (`eos run start --procedure <slug>`) | The first time a recurring task is done well enough to be worth repeating; `eos procedure audit` checks counters against the ledger, `eos procedure lint` the tools its steps name |
+| `eos cite [--output file]` | References and quotes in an answer that cannot be right: a missing file, a line past the end, a quote not at the lines it cites. Exit 1 when it finds one | Before handing over an answer that cites code |
+| `eos note add … --supersedes "<note>"` | Records a note that replaces an older one: the old note stays as the record, search and briefs stop offering it, `note show` points to the new one | When what a note says is no longer true -- rather than writing a second note beside it |
+| `eos note graph [--output file]` | The note graph's size by kind; `--output` writes it for Graphify's community and visual views (`graphify cluster-only <dir> --graph <file> --no-label`) | When the shape of what is known matters more than one note |
+| `eos note related "<note>"` | The notes linked to one: a note citing it, the lessons of a procedure, notes watching the same file or naming the same ticket -- each with its reason | Before acting on a note or a procedure: what else is known next to it |
+| `eos consolidate` | One report of what needs attention: procedures failing or never run, lint, notes that read alike, notes whose files changed, runs open for days, stale work, the verified rate; with `[model_routing] corpus`, routing accuracy on its dev rows and keyword proposals. Changes nothing; `--accept <id>` only records a proposal a person took | Now and then, or before tidying the project's memory |
+| `eos brief --resume` / `eos brief --for-subagent --task "…"` | What this session left open (runs, held work, failures); the short handoff a subagent should start with | After a clear or a compaction; before starting a subagent by hand |
+| `eos run list` / `eos run show <id>` | Past executions and one run's timeline: which tools ran, against what, with what exit code, and how it ended | Before repeating a task: what happened the last time it was done |
+| `eos run tools [--procedure P] [--target T]` / `eos run diff <id>` | Which tools a task has used, how often, how often they exited non-zero and how the last run went; what one run changed — the paths it recorded and the commits and files in its commit range | When choosing how to do something the project has done before, and when asked what a previous run actually changed |
+| `eos query "<sql>"` | Work joined against everything else indexed: `work_item`, `work_holder`, `work_event` next to `git_commit_ticket`, `note` and any extension's tables | When the question is about work *and* something else — which flow a claim touches, whether its ticket has commits |
+| `eos rules [--untested]` | Which refusals this code can raise, and what the tests do about each | Before writing a test, and before claiming a behaviour is covered |
+| `eos trace <file>` | What an entry point serves and reaches — **and how much of the system no call graph can reach** | When asked "what does this endpoint do" on a system whose components are looked up by name |
+| `eos why <file>` | Where a fact came from: detector, origin, confidence, `path:line` — and which detectors found nothing | When an answer looks wrong or suspiciously empty |
+| `eos draft-test <code>` | The skeleton of the missing test -- the right method name, assertion library and code to assert -- with the arrangement left to you | When `eos rules` says a refusal is `reachable`, to start from the file's own conventions rather than a blank line |
+| `eos verify <code>` | Records what an adapter ran and what happened | After running a test, so the next session does not re-run it to find out |
+| `eos findings` | Every recorded run and what it was judged to be | Before re-testing something |
+| `eos ask [question] [value]` | Questions this project's index extensions provide; with no question, the list of them | First, on any project with extensions — it is where project-shaped answers live |
+| `eos parent <symbol>` | Real source from a linked parent project, by symbol | On an overlay codebase, whenever the class that decides the behaviour is not in this project |
+| `eos cost` | What EOS has cost this project per command, and how many sessions reached for it at all | When deciding whether a habit is worth keeping |
+| `eos work stats [--since]` | What came of the work: collisions, claims that went quiet, time from claim to close | When asking whether any of this is helping, rather than how often it ran |
+
+Two of these are worth a habit.
+
+**`eos rules --untested` before writing a test.** It separates four states, and
+the useful one is `reachable`: a test already reaches the class that raises the
+refusal and nothing asserts it. The fixture exists, so the missing work is one
+assertion — and `eos draft-test` drafts the skeleton to start it from, with
+the arrangement left to you.
+
+**`eos why` when an answer is empty.** An empty impact result and a detector
+that never ran look identical. `why` is the only thing that separates them, and
+guessing wrong there wastes a whole investigation.
+
+## What this system will not tell you
+
+It records what was run; it does not conclude what a failure meant. A failing
+test can mean the rule is not enforced, the test is wrong, or the environment
+was — nothing in an exit code separates those, so `eos verify` stores a
+`verdict` only when a person passes one. Treat any claim of a defect that did
+not come from a person looking at a log as something this system did not make.
+
+## Costs are shaped by the project, not fixed
+
+The "rough cost" column above is a shape, not a measurement of this codebase.
+On one Java overlay codebase, `get_context` returned roughly as many tokens as
+reading four or five mid-sized source files directly — informative context for
+that project's size, not a number that transfers to a project ten times
+larger or one file per directory instead of twenty.
+
+If `.eos/data/bench.md` exists in this project, it holds numbers measured
+here, not elsewhere. Prefer it over the table above whenever the two disagree
+— it is describing the codebase actually in front of you.
+
+## The session loop
+
+This is the one part nothing else substitutes for. Six steps, in the order a
+session lives them. Where the hooks are installed, steps 1 and 2 have already
+happened and their output is above.
+
+1. **Open** — `eos brief <project>`: what is claimed, blocked, stale or left
+   running here, and the notes that match this branch.
+2. **Take the task** — `eos brief <project> --task "<the task>"`: the procedure
+   recorded for it, as steps, with its success criteria, run counts and a
+   confidence word (`failing`, `unverified`, `fresh`, `aging`, `stale`); its
+   last three runs and the lesson of the last failure; the nearest notes. If a
+   procedure is recorded, follow it. If none is, say so and work from source —
+   do not present improvised steps as this project's.
+3. **Start** — `eos work add <project> --title "…" --claim` for the work, and
+   `eos run start <project> --title "…" [--procedure <slug>] [--target <env>]`
+   for this attempt at it. The run is what the next session will read as "what
+   happened last time".
+4. **Act** — through the project's wrappers where it has them; each one
+   appends an event to your open run on its own (`eos-event`, or `eos run
+   event` by hand for anything done outside them). `eos verify` inside the run
+   lands on its timeline.
+5. **Finish** — `eos run finish <project> --outcome ok|failed|abandoned`. A
+   failed run must carry `--lesson "what to do differently"`; it becomes a
+   lesson note linked to the run, and the procedure's counters move. Abandoned
+   says nothing about whether the procedure works, and counts nothing.
+6. **Record** — `eos procedure new` the first time a recurring task was done
+   well enough to repeat; `eos note add` for anything the next `eos scan`
+   could not re-derive (a non-obvious cause, a measured cost, a constraint
+   invisible in the code); `eos work done|block|drop` for where the work got
+   to. Where a Stop hook is installed it asks once about work you hold and
+   runs you left open — every honest answer is accepted.
+
+---
+
+These are inputs to your judgement, not rules. If a cheaper path answers the
+question, take it.

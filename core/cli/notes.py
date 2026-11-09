@@ -1,0 +1,487 @@
+"""Note commands: add, show, search, amend, skip, eval, audit, findings.
+
+Moved out of core/eos.py (2.x roadmap F4), unchanged.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import sys
+from pathlib import Path
+from core import notes
+from core.cli.common import _PLACEHOLDER_WARNING, _no_notes_here, _split_csv
+
+
+def cmd_findings(args: argparse.Namespace) -> int:
+    """Recorded runs, newest first, and what they were judged to be."""
+    from core import verification
+
+    records = verification.load(args.path)
+    if args.failed_only:
+        records = [entry for entry in records if entry.outcome != verification.PASSED]
+    if args.format == "json":
+        print(json.dumps([entry.to_dict() for entry in records], indent=2, ensure_ascii=False))
+        return 0
+    if not records:
+        print("No run has been recorded here. `eos verify` records one; "
+              "`eos draft-test` drafts a skeleton to start the test from.")
+        return 0
+    for entry in reversed(records):
+        verdict = entry.verdict or ("-" if entry.outcome == verification.PASSED else "no verdict yet")
+        print(f"{entry.recorded_at}  {entry.outcome:<8} {entry.code:<40} {verdict}")
+        print(f"    {entry.command}")
+        if entry.log:
+            print(f"    log {entry.log}")
+        if entry.note:
+            print(f"    {entry.note}")
+    summary = verification.summary(args.path)
+    print(f"\n{summary['runs']} run(s) over {summary['codes']} code(s): "
+          f"{summary['outcomes']}" + (f", verdicts {summary['verdicts']}" if summary["verdicts"] else ""))
+    return 0
+
+
+def cmd_note_add(args: argparse.Namespace) -> int:
+    # `--scope ,` (likewise `""`, `" "`, `",,"`) splits to nothing, and
+    # passing that through as "no scope" wrote a note with neither `scope:`
+    # nor `scope_hashes:` -- un-monitorable for the rest of its life, on
+    # exit 0, from a typo, on the command that wrote every note in the
+    # corpus. The same silent data loss `amend` refuses. Checked here rather
+    # than in `add_note` because only the CLI can tell "the caller typed
+    # --scope and it named nothing" from "there is no scope", which is the
+    # normal case for most notes and stays legal: `scope=[]` reaching
+    # `add_note` from a generator means the latter.
+    scope = _split_csv(args.scope)
+    if args.scope is not None and not scope:
+        print(
+            "error: --scope was given but names nothing; drop the flag if this "
+            "note is not about specific files, rather than writing a note that "
+            "can never be checked against the code.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        path = notes.add_note(
+            args.path,
+            kind=args.kind,
+            title=args.title,
+            body=args.body,
+            tags=_split_csv(args.tags),
+            scope=scope,
+            source=args.source,
+            cause=args.cause,
+            solution=args.solution,
+            metric=args.metric,
+            session=args.session,
+            procedure=args.procedure,
+            execution=args.execution,
+            evidence=args.evidence,
+            supersedes=args.supersedes,
+            provenance=args.provenance,
+            agent=args.agent,
+            valid_until=args.valid_until,
+            projects=_split_csv(args.projects),
+            differs=args.differs,
+            aliases=args.alias,
+            summary=args.summary,
+            strict=True,
+        )
+    except (ValueError, FileExistsError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    from core import executions
+
+    executions.note_written(args.path, path, action="note add", session=args.session)
+    print(f"Note written to {path}")
+    return 0
+
+
+def cmd_note_list(args: argparse.Namespace) -> int:
+    recorded = notes.load_notes(args.path)
+    matches = [note for note in recorded if args.tag in note.tags] if args.tag else recorded
+    # A replaced or expired note listed beside the current one reads as current
+    # too; search and briefs already leave them out, so the listing does.
+    replaced = notes.superseded(recorded)
+    hidden = 0
+    for note in matches:
+        stale = []
+        if note.path.name in replaced:
+            stale.append("superseded by " + ", ".join(replaced[note.path.name]))
+        if notes.expired(note):
+            stale.append(f"expired {note.valid_until}")
+        if stale and not args.all:
+            hidden += 1
+            continue
+        print(f"{note.path.name}\t{note.kind}\t{note.title}" + (f"\t[{'; '.join(stale)}]" if stale else ""))
+    if hidden:
+        print(f"{hidden} hidden (superseded or expired); --all lists them, marked")
+    if matches:
+        return 0
+    if not recorded:
+        print(_no_notes_here(args.path))
+        return 0
+    tags = sorted({tag for note in recorded for tag in note.tags})
+    print(f"{len(recorded)} note(s) recorded, none tagged {args.tag!r}. "
+          + (f"Tags in use: {', '.join(tags)}." if tags else "No note carries a tag."))
+    return 0
+
+
+def cmd_note_show(args: argparse.Namespace) -> int:
+    """Print one note in full, by file name or by part of its title.
+
+    `note search` and `note list` print titles, and until now nothing printed
+    a body: the only way to read what an earlier session wrote was to phrase a
+    `compose` task narrow enough to rank that note into the top few. Two
+    surfaces sent readers the wrong way about it -- compose's own truncation
+    footer told them to use `note search`, which returns titles -- and an eval
+    session tested that instruction against a near-verbatim title, got 29
+    loose matches and no body, and concluded the tool was contradicting
+    itself. It was.
+    """
+    # A generator's note too: `note search --generated` names it (M3).
+    recorded = notes.load_notes(args.path) + notes.shared_notes(args.path) + notes.load_generated(args.path)
+    if not recorded:
+        print(_no_notes_here(args.path))
+        return 0
+    needle = args.name.casefold()
+    exact = [note for note in recorded if note.path.name.casefold() == needle]
+    matches = exact or [note for note in recorded
+                        if needle in note.path.name.casefold() or needle in note.title.casefold()]
+    if not matches:
+        print(f"No note matches {args.name!r} among {len(recorded)} recorded here. "
+              f"`eos note search {args.path} \"{args.name}\"` searches their contents.",
+              file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        # Printing the first would be a coin toss presented as an answer.
+        print(f"{len(matches)} notes match {args.name!r}; name one of them:", file=sys.stderr)
+        for note in matches[:10]:
+            print(f"  {note.path.name}\t{note.title}", file=sys.stderr)
+        return 1
+    replacements = notes.superseded(recorded).get(matches[0].path.name)
+    if replacements:
+        print(f"Superseded by {', '.join(replacements)} -- read that; this is the record of what was believed "
+              "before.\n")
+    elif not notes.is_generated(matches[0]) and not notes.expired(matches[0]):
+        notice = notes.drift_notice(args.path, matches[0], notes.scope_drift(args.path, matches[0]))
+        if notice:
+            print(notice)
+        review = notes.review_mark(matches[0], notes.review_after_days(args.path))
+        if review:
+            print(f"{review} not confirmed since {matches[0].updated or matches[0].created}: still true? "
+                  f"`eos note amend {shlex.quote(str(matches[0].path))} {shlex.quote(str(args.path))} --reaffirm '<why it still holds>'`\n")
+    print(matches[0].path.read_text(encoding="utf-8"))
+    _record_read(args.path, matches[0])
+    return 0
+
+
+def _record_read(project_root, note) -> None:
+    """A `read` event on the session's open run, if it has one (M6, ADR-036)."""
+    from core import executions, priors
+
+    try:
+        if executions.current(project_root) is not None:
+            executions.event(project_root, None, kind="read", ref=priors.note_ref(note.path.name),
+                             source="cli", status="ok")
+    except (ValueError, OSError):
+        pass  # recording what was read never fails the read
+
+
+def cmd_note_related(args: argparse.Namespace) -> int:
+    """The notes linked to one: citations, a lesson's procedure, shared scope files, shared tickets."""
+    from core import note_graph
+
+    recorded = notes.load_notes(args.path)
+    needle = args.name.casefold()
+    exact = [note for note in recorded if note.path.name.casefold() == needle or note.title.casefold() == needle]
+    matches = exact or [note for note in recorded
+                        if needle in note.path.name.casefold() or needle in note.title.casefold()]
+    if len(matches) != 1:
+        print(f"{len(matches)} notes match {args.name!r}; name exactly one (file name or title).", file=sys.stderr)
+        for note in matches[:10]:
+            print(f"  {note.path.name}\t{note.title}", file=sys.stderr)
+        return 1
+    found = note_graph.related(recorded, matches[0].path.name, note_graph.pattern_for(args.path), limit=args.limit,
+                               project_root=args.path)
+    if not found:
+        print(f"No note is linked to {matches[0].title!r}: no citation, lesson, shared scope file or ticket.")
+        return 0
+    for note, why in found:
+        print(f"{note.path.name}\t{note.kind}\t{note.title}\t({why})")
+    return 0
+
+
+def cmd_note_graph(args: argparse.Namespace) -> int:
+    """The note graph: its size by kind, or the whole graph as node-link JSON."""
+    import collections
+
+    from core import note_graph
+
+    recorded = notes.load_notes(args.path)
+    found = note_graph.edges(recorded, note_graph.pattern_for(args.path), args.path)
+    kinds = collections.Counter(edge.kind for edge in found)
+    linked = {name for edge in found for name in (edge.src, edge.dst)}
+    print(f"{len(recorded)} notes, {len(found)} edge(s) ({', '.join(f'{k} {n}' for k, n in kinds.most_common())}); "
+          f"{len(linked)} notes linked")
+    if args.output:
+        from core.lib import atomic
+
+        atomic.write_text(args.output, json.dumps(note_graph.node_link(recorded, found), ensure_ascii=False))
+        print(f"wrote {args.output}: graphify cluster-only <dir> --graph {args.output} --no-label draws it")
+    return 0
+
+
+def cmd_note_search(args: argparse.Namespace) -> int:
+    matches = notes.search_notes(args.path, args.query, limit=args.limit, generated=args.generated)
+    defaults = notes.review_after_days(args.path)
+    for note in matches:
+        mark = "" if notes.is_generated(note) else notes.drift_mark(notes.scope_drift(args.path, note))
+        if not notes.is_generated(note):
+            mark = " ".join(part for part in (mark, notes.review_mark(note, defaults)) if part)
+        print(f"{note.path.name}\t{note.kind}\t{note.title}" + (f"\t{mark}" if mark or note.summary else "")
+              + (f"\t{note.summary}" if note.summary else ""))
+    if matches:
+        return 0
+    recorded = notes.load_notes(args.path)
+    if not recorded:
+        print(_no_notes_here(args.path))
+        return 0
+    # It searched and found none, which is a finding -- and a different one
+    # from having had nothing to search. A session that cannot tell those
+    # apart re-derives from source what an earlier session already paid for.
+    print(f"Searched {len(recorded)} note(s); none match {args.query!r}. "
+          f"`eos note list {args.path}` lists every one of them.")
+    return 0
+
+
+def cmd_note_move_generated(args: argparse.Namespace) -> int:
+    try:
+        moves = notes.move_generated(args.path, apply=args.apply)
+    except FileExistsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not moves:
+        print(f"Nothing to move: no generator note in {notes.notes_dir(args.path)}.")
+        return 0
+    for old, new in moves:
+        print(f"{old.name}\t-> {new.parent.name}/{new.name}")
+    target = notes.generated_dir(args.path)
+    if args.apply:
+        print(f"moved {len(moves)} note(s) to {target}; recorded in {target / notes.MOVED_FILE}")
+    else:
+        print(f"{len(moves)} note(s) would move to {target}; --apply moves them")
+    return 0
+
+
+def cmd_note_eval(args: argparse.Namespace) -> int:
+    """Score note search against questions somebody wrote the answers for.
+
+    Exits non-zero only when the golden file itself is broken -- unreadable, or
+    naming a note that no longer exists. A low score is a measurement and must
+    not fail a run, or the number stops being reported honestly.
+    """
+    from core import retrieval
+
+    try:
+        entries = retrieval.parse_golden(args.golden)
+    except (retrieval.GoldenError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    report = retrieval.evaluate(args.path, entries, depth=args.depth, surface=args.surface)
+    if args.format == "json":
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(retrieval.render(report))
+    return 1 if report["broken"] else 0
+
+
+def cmd_note_skip(args: argparse.Namespace) -> int:
+    # `record_skip` had no refusal path until the placeholder guard, so this
+    # handler was not needed and was not written -- and its absence turned an
+    # instructive one-sentence refusal into a six-frame traceback with the
+    # sentence buried at the bottom. Same shape as cmd_note_add's and
+    # cmd_note_amend's.
+    try:
+        path = notes.record_skip(args.path, reason=args.reason, session=args.session)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Recorded: no note for this session ({args.reason}) -> {path}")
+    return 0
+
+
+def cmd_note_amend(args: argparse.Namespace) -> int:
+    body = args.body
+    if body == "-":
+        body = sys.stdin.read()
+    # _split_csv("") returns None, the same value it returns for --scope
+    # never having been passed at all -- so a caller who typed `--scope ""`
+    # (or `--scope ,`, which splits to []) would otherwise be told "amend
+    # needs at least one of --body, --reaffirm, or --scope", a message that
+    # contradicts what they actually typed. Normalize any explicitly-passed
+    # but empty value to `[]` so amend_note's own refusal (which names
+    # --scope specifically) is the one the caller sees.
+    scope = None
+    if args.scope is not None:
+        scope = _split_csv(args.scope) or []
+    try:
+        path = notes.amend_note(
+            args.note,
+            args.path,
+            body=body,
+            reaffirm=args.reaffirm,
+            scope=scope,
+            session=args.session,
+            provenance=args.provenance,
+            agent=args.agent,
+            valid_until=args.valid_until,
+            supersedes=args.supersedes,
+            expire=args.expire,
+            append=args.append,
+            aliases=args.alias,
+            summary=args.summary,
+        )
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    from core import executions
+
+    executions.note_written(args.path, path, action="note amend", session=args.session)
+    print(f"Note amended: {path}")
+    if body:
+        # Reported, not refused (2.x roadmap M5): amend is the way out of other guards.
+        in_generated = Path(path).parent == notes.generated_dir(args.path)
+        corpus = (notes.load_generated if in_generated else notes.load_notes)(args.path)
+        twin = notes.paraphrase_of(corpus, body, exclude=Path(path))
+        if twin is not None:
+            print(f"warning: {twin.path} ({twin.title!r}) says this in other words; "
+                  "consider keeping one of the two", file=sys.stderr)
+    return 0
+
+
+def cmd_note_audit(args: argparse.Namespace) -> int:
+    """Report notes whose scoped files have moved. Always exit 0: this is a
+    report, not a gate -- the Stop hook is the gate, and it blocks only on
+    the hand-written half."""
+    handwritten, generated = [], []
+    for item in notes.stale_notes(args.path):
+        (generated if item["generated"] else handwritten).append(item)
+
+    # Resolved the same way the Stop hook resolves it, through notes_dir() --
+    # never rebuilt as `<root>/.eos/knowledge/<name>`. Every overlay service
+    # configures [knowledge] dir outside the service itself, so a hand-built
+    # path would print an `eos note amend` command naming a file that does
+    # not exist, on all 18 of them.
+    directory = notes.notes_dir(args.path)
+    root = Path(args.path).expanduser().resolve()
+
+    def _note_path(item):
+        return directory / item["note"]
+
+    def _title(item):
+        try:
+            return notes.parse_note(_note_path(item)).title
+        except Exception:
+            return item["note"]
+
+    def _kind(item):
+        try:
+            return notes.parse_note(_note_path(item)).kind
+        except Exception:
+            return ""
+
+    if handwritten:
+        print("Hand-written notes that may now be wrong:")
+        for item in handwritten:
+            scopes = ", ".join(issue["scope"] for issue in item["issues"])
+            print(f"  {_title(item)!r} ({_note_path(item)})  [{scopes}]")
+        print(f"  {_PLACEHOLDER_WARNING}")
+        for item in handwritten:
+            note_path = _note_path(item)
+            # Classified by the whole note, in the same three shapes the Stop
+            # hook's `_amend_flags` uses and for the same reason: `amend_note`
+            # validates EVERY scope entry, so one entry's refusal governs the
+            # command whatever the others report. Two surfaces printing
+            # different remedies for one state is what this replaced -- the
+            # split here was two-way, so the mixed note was handed `--scope`
+            # alone, which exits 1.
+            gone = [i["scope"] for i in item["issues"] if i.get("reason") == "removed"]
+            changed = [i["scope"] for i in item["issues"] if i.get("reason") != "removed"]
+            if not gone:
+                flags = "--body '<what is true now>'"
+            elif not changed:
+                flags = "--scope '<the new project-relative path>'"
+            else:
+                flags = ("--scope '<the project-relative paths this note is still "
+                         "about>' --body '<what is true now>'")
+            if gone:
+                print(f"  {', '.join(gone)} no longer exists, so --body and "
+                      "--reaffirm can only refuse (they re-hash that path).")
+                print(
+                    f"  {', '.join(changed)} did change, so a scope-only amend is "
+                    "refused too -- one command does both:"
+                    if changed else
+                    "  Re-point the note at where the code moved:"
+                )
+            print(f"  eos note amend {note_path} {root} {flags}")
+            if "--body" in flags and _kind(item) == "defect":
+                print("    (a defect note's new body must keep its Root cause, "
+                      "Solution and Metric sections)")
+            if gone:
+                if not changed:
+                    print("  ...and add --body '<what is true now>' to that same "
+                          "command if the move changed what the note claims.")
+                continue
+            print(
+                f"  ...or, if the change does not affect what the note claims: "
+                f"eos note amend {note_path} {root} --reaffirm '<why it still holds>'"
+            )
+    if generated:
+        print(f"Generated notes gone stale: {len(generated)}")
+        for item in generated:
+            print(f"  {_title(item)!r} ({_note_path(item)})  (source: {item['source']})")
+        print("  Fix: regenerate them; do not edit these by hand.")
+    unhashed = notes.unhashed_notes(args.path)
+    if unhashed:
+        print("UNHASHED: scope entries with no recorded hash whose file exists now; "
+              "nothing can flag these notes stale until one is recorded:")
+        for item in unhashed:
+            print(f"  {_title(item)!r} ({_note_path(item)})  [{', '.join(item['scope'])}]")
+            print(f"  eos note amend {_note_path(item)} {root} --reaffirm '<why it still holds>'")
+    corpus = notes.load_notes(args.path)
+    replaced = notes.superseded(corpus)
+    for note in corpus:
+        if notes.is_generated(note) or notes.is_bulk_index(note) or notes.expired(note) \
+                or note.path.name in replaced:
+            continue
+        sentence = notes.undated_count(note.kind, note.body)
+        if sentence is None:
+            continue
+        clipped = sentence if len(sentence) <= 100 else sentence[:99] + "…"
+        print(f"UNDATED COUNT: {note.title!r} ({note.path})  \"{clipped}\" -- say when it was true "
+              "(a date in the sentence) or leave the number out")
+    if not handwritten and not generated and not unhashed:
+        # How many were examined, not just that none failed. "No stale notes."
+        # reads the same whether it checked forty notes or found the knowledge
+        # directory empty, and those call for opposite next actions.
+        checked = len(notes.load_notes(args.path))
+        print(f"Checked {checked} note(s); every scoped path still matches what "
+              "the note recorded." if checked else _no_notes_here(args.path))
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    return {
+        "add": cmd_note_add,
+        "list": cmd_note_list,
+        "search": cmd_note_search,
+        "move-generated": cmd_note_move_generated,
+        "show": cmd_note_show,
+        "related": cmd_note_related,
+        "graph": cmd_note_graph,
+        "eval": cmd_note_eval,
+        "skip": cmd_note_skip,
+        "amend": cmd_note_amend,
+        "audit": cmd_note_audit,
+    }[args.note_command](args)

@@ -1,0 +1,225 @@
+# ADR-025: EOS advises which model and how much effort; the harness executes
+
+## Status
+
+Accepted, 2026-09-25. Plan: `docs/plans/model-routing.md`.
+
+## Context
+
+A coding agent spends most of its budget on the model it runs and the effort
+it reasons at. Both are usually left at whatever the session started with,
+which means a typo fix and a service-boundary design are paid for at the same
+rate. Agent harnesses that route by task — the three-tier router in the Ruflo
+harness is the example studied — save most of that spend by sending simple
+work to a cheap model and keeping the strong one for the work that needs it.
+
+EOS is the one component every session here already consults about the task
+before starting it (`eos brief --task`, ADR-021/024). It is the natural place
+for that decision. It is also a component that does not call a language
+model: nothing under `core/` imports a provider SDK or sends a prompt. The
+harness runs EOS; EOS does not run the harness.
+
+## Decision
+
+**EOS advises; the harness executes.** `core/routing` produces a normalised
+decision — a model id from a registry, an effort level, a one-sentence reason,
+a confidence — and renders it where the harness can act on it: a `ROUTE` line
+in the task brief, `eos route`, an MCP tool, and optionally a `PreToolUse`
+hook that fills the model of a subagent call that did not name one. EOS never
+emits provider API configuration and never calls a provider.
+
+**The policy is deterministic and explainable.** A task is classified into a
+fixed taxonomy of twelve types by weighted keyword tables and four ordered
+rules. A complexity score is a weighted sum of seven named factors, each
+between 0 and 1 and each printed with the decision; the sum is cut into
+`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`. The same text under the same
+configuration gives the same decision. There is no learned component: an
+opaque decision about cost is one nobody can correct.
+
+**The cheapest sufficient model wins.** Each level states a minimum
+reasoning and coding capability; the registry answers with every available
+model that meets it, cheapest first, and the first is chosen. The strongest
+model is chosen only when the level requires it or when nothing else
+qualifies — and then the reason says so.
+
+**Effort is clamped, never invented.** Each registered model lists the effort
+levels it accepts. One function turns a requested effort into one the model
+supports — the requested value, else the highest supported value below it,
+else the lowest supported. No other code path returns an effort, so no
+decision can pair a model with a value its provider would refuse.
+
+**Uncertainty alone never escalates.** Ruflo recorded (issue #2250) that an
+uncertainty gate promoted nearly every trivial task to a stronger tier. Here
+uncertainty is one factor at the smallest weight, with no gate of its own.
+
+**Explicit choices are respected.** A model or effort given on the command
+line, in the environment or in `.eos/config.toml` overrides the policy for
+that half of the decision, in that precedence. An explicit model that is
+unknown or unavailable is refused rather than substituted.
+
+**Models live in a registry, not in the policy.** Three generic tiers ship as
+a Python constant (the runtime updater copies `*.py` only), and a project
+adds or corrects entries under `[model_routing.models]`. No model name
+appears in the policy's logic.
+
+**One decision per run, recorded without the task.** When a session has an
+open execution (ADR-022), the decision is appended to it as a `decided` event
+and later calls in the same run return it again instead of reclassifying. A
+line in `.eos/data/routing.jsonl` records the decision with a hash of the
+task text, never the text (ADR-019).
+
+**Learning from outcomes is deferred.** The trace joins to the run's outcome,
+and `eos route --stats` prints type, level, model and effort against it.
+Nothing reads those outcomes to change a decision: that would be the engine
+drawing a conclusion from runs, which ADR-018 does not allow it to do on its
+own. The seam is one function, `policy.adjust_for_history`, which returns its
+input unchanged. A later decision may give it something to read.
+
+## Consequences
+
+Without a `[model_routing]` table nothing a session sees changes: the brief's
+ROUTE line is off by default, and every existing command's output is
+byte-identical.
+
+Effort is advisory in practice. The harness studied accepts a model per
+subagent call but takes effort only per session or per agent definition, so
+the ROUTE line names the command that sets it and the hook leaves it alone.
+
+The classifier is keyword-based and English by default. A project whose
+prompts are written in another language extends it in config; the engine
+ships no second language (ADR-013's argument).
+
+The default capability numbers are defaults, not facts about vendors. A
+project that measures otherwise corrects them in config, and the policy
+follows without a code change.
+
+## Addendum, 2026-09-26 (1.4.0): a project's own language, and a hook that fails safe
+
+**Measured first.** In one workspace 97% of the prompts people typed were
+Turkish, while the classifier matched English inflections only (`s`, `es`,
+`ed`, `ing`, `d`): a configured `hata` never met `hatası`. The rule lists
+(question openers, repository-wide phrases, failure words, change and
+implementation verbs) and the complexity factors (architectural, risk and
+hedge words) were constants no config could reach.
+
+**Decision: generic mechanisms, language in config.** The engine gains no
+language: `[model_routing.keywords]` accepts stems (`hata*` matches every word
+starting `hata`; at least three characters before the `*`),
+`[model_routing.rules]` extends the rule lists and `[model_routing.factors]`
+the factor lists -- both add to the built-in words, never replace them, so a
+project without the tables decides byte-for-byte as before (tested over the
+whole English corpus). Normalisation maps the dotted capital I (U+0130) to a
+plain "i", because `str.lower()` otherwise leaves a combining dot behind. Rules
+still act only on a task some keyword classified, as the built-in rules always
+have.
+
+**The subagent hook fails safe, in one function** (`routing.withheld`): a dry
+run applies nothing; a decision below `hook_min_confidence` is recorded and
+**not** applied, and nothing is chosen in its place; a model that does not
+meet the level's capability requirement is never applied, so a CRITICAL task
+on the cheapest tier is impossible there even when an override named it.
+Every decision -- applied, withheld or dry -- is recorded on the open run with
+the request's hash (never its text), the classification, the model, the
+confidence and the harness's call id, which a review joins to the harness's
+own transcript.
+
+**The gate is part of the engine.** `eos route --eval <corpus> --split
+dev|test` reports model accuracy, a confusion matrix, under-routing (a task
+labelled HIGH or CRITICAL sent to a model cheaper than every model its label
+accepts), CRITICAL tasks on the cheapest model and efforts a model would
+refuse, and exits 0 on PASS, 1 on FAIL. The thresholds are constants
+(accuracy >= 0.85, under-routing <= 0.03, 0, 0). A corpus with the same prompt
+in both splits is refused; the test split prints no rows and no suggestions,
+and every test measurement is logged with hashes of the corpus and of the
+routing configuration, so a test set measured again after tuning is visible.
+
+## Addendum (2026-09-28, 1.34.0): the no-signal type is a project's choice
+
+A task that no table matches -- built-in or configured -- has no evidence for any
+type, and `classify()` used to answer `normal_implementation` for it
+unconditionally. On one host's labelled corpus a third of the development prompts
+matched nothing, and their true types skewed elsewhere (mostly `investigation`).
+`[model_routing] default_task_type` names the fallback; unset, it stays
+`normal_implementation`. It changes only the no-match branch: confidence stays
+`NO_MATCH_CONFIDENCE`, no rule runs, level and model follow the scorer as before.
+Which value a project sets is decided on its own corpus's development split.
+
+## Addendum (2026-09-28, 1.35.0): `verify_depth`'s one consumer
+
+`verify_depth` (1.33.0) had no reader. The Stop verify gate (`[hooks] verify`)
+is now the one: when the gate has already fired for another reason (a changed
+scope with no passing check since), a run following a procedure routed at
+depth 2 gets one more line naming that procedure's own read-only `## Success`
+checks -- `eos verify --procedure <slug>` -- when it has any. Depth 0/1 change
+nothing, and a session with no routed decision at all (no open run, or a run
+with no `decided` event) sees the gate exactly as it did before this existed:
+the hint is additive to an already-fired gate, never a trigger of its own.
+
+## Addendum (2026-09-28, 1.36.0): a tuned policy is accepted with a receipt (L5)
+
+A project that tunes the policy -- `[model_routing]` keywords, rules, factors,
+models, or a `default_*` key -- makes decisions the engine's own tests never
+saw. Its receipt is a test-split measurement taken under exactly that
+configuration: the `routing-eval.jsonl` entry, which now also records the
+engine version and the corpus file name. `eos doctor` warns (never fails) while
+the current configuration's hash has none; a dev measurement is tuning and does
+not count. The hash now covers every key that changes a decision --
+`default_task_type`, `default_model` and `default_effort` were missing, so a
+changed fallback read as the same configuration. A default written out equal to
+the engine's hashes as if absent, so no existing receipt moves for a project
+that does not use them. A project with the table but nothing tuned runs the
+engine's policy and needs no receipt of its own.
+
+The engine's own numbers -- the gate's thresholds, the scorer's level
+boundaries, `VERIFY_DEPTH`, `route --learn`'s bars -- change only with a
+measurement on a labelled corpus and an addendum here naming it.
+`policy.adjust_for_history` still reads no outcome and `route --learn` still
+only prints: what a person accepts into the config is the only way history
+changes a decision.
+
+## Addendum (2026-10-13): the routing corpus is named in config; `consolidate` proposes, a person accepts (L1)
+
+`eos route --eval` was always given its corpus on the command line, so nothing
+else could find it: `eos consolidate` had no labelled rows to measure against
+and no words to propose from (`routing.jsonl` keeps no task text, ADR-019).
+
+**`[model_routing] corpus`** names one project-relative TSV in the `route
+--eval` format, or a list of them (a project that tunes on one corpus and
+guards against breaking the others names them all). It changes no decision:
+`config_hash` leaves it out, so no receipt moves, and a table that holds only
+`corpus` does not count as configuring routing -- the brief prints no ROUTE line
+for it. There is no split selector: what is read is the development rows,
+`split = dev` or no split at all (the way `route --eval` tunes a corpus without
+splits), and never a test row -- nor a development row whose prompt another
+named corpus holds for test. The test split stays the once-measured receipt
+(L5), read only by `route --eval --split test`.
+
+**What `consolidate` prints with it.** The policy's accuracy on each corpus's
+development rows, from `evaluate.run`; advised against used over the routed
+runs (`trace.advised_vs_used_outcome_stats`, the join `route --stats` and
+`route --learn` read); and keyword proposals. A proposal is a whole word of a
+mistyped development row that, added to the row's labelled type in
+`[model_routing.keywords]`, moves at least two development rows to their label
+and moves no correctly typed row off its own -- measured by classifying the
+rows again with the word added. A word any keyword table already holds is a
+contest between types, not a gap, and a word most of whose rows carry another
+label is not that type's word; neither is proposed. Stems (`word*`) are left to
+the person, who sees the inflections. `consolidate` writes no config.
+
+**Accepted is counted.** Each proposal has a stable id (`kw-` and eight hex
+digits of its type and word). `eos consolidate <path> --accept <id>` appends
+one line -- the time, the id, the proposal -- to
+`.eos/data/consolidate-accepted.jsonl`; it refuses an id no current proposal
+has and one already accepted, and writes nothing else. A person accepts before
+editing the config, because a word in the table is no longer proposed. The
+report prints how many were accepted in the last 30 days: Phase 6's "acted on
+at least once per month" is that number, read, not inferred.
+
+Routing every corpus row inside `consolidate` made one fix necessary: a
+decision that is neither reused (`fresh`) nor recorded no longer looks up the
+session's open run, which it never used. Measured on one host from inside a
+session with an open run, that lookup was a full ledger read per prompt -- 3.8 s
+for 115 rows, 0.1 s without it -- and `route --eval` gains the same. The verification
+read behind each run's `outcome_source` is skipped where only the groups are
+counted (`sources=False`). With three corpora (188 development rows) the
+routing part of `consolidate` costs that host about 0.5 s.

@@ -1,0 +1,1184 @@
+"""`eos hook <event>`: one entry point for every harness hook (ADR-026).
+
+The payloads below are the shapes Claude Code 2.1.281 was recorded sending by
+a probe of every event: `agent_id`/`agent_type` only inside a subagent, a
+failed Bash call as its own event with `error: "Exit code N"`, `effort` only
+where the model takes one. Every path must exit 0 and stay silent on failure.
+"""
+import io
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from core import executions, hooks
+
+REPO = Path(__file__).resolve().parents[1]
+EOS = [sys.executable, str(REPO / "core" / "eos.py")]
+
+REGISTRY = """
+[[capability]]
+name = "tracker"
+run = "scripts/tracker.sh"
+does = "issue|search <KEY>"
+words = ["tracker", "ticket"]
+hint = ['curl\\s[^|;&]*tracker\\.example']
+"""
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    root.mkdir()
+    assert subprocess.run(EOS + ["init", str(root), "--no-ai"], capture_output=True).returncode == 0
+    knowledge = root / ".eos" / "knowledge"
+    knowledge.mkdir(parents=True, exist_ok=True)
+    (knowledge / "capabilities.toml").write_text(REGISTRY, encoding="utf-8")
+    monkeypatch.setenv("EOS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("EOS_HOOK_STATE_DIR", raising=False)
+    monkeypatch.delenv("EOS_EXECUTION", raising=False)
+    monkeypatch.delenv("EOS_EXECUTION_LEDGER", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s1")
+    return root
+
+
+def _hook(monkeypatch, capsys, event, payload, *extra):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload) if isinstance(payload, dict) else payload))
+    assert hooks.main([event, *extra]) == 0
+    return capsys.readouterr()
+
+
+def _payload(root, **fields):
+    return {"session_id": "s1", "cwd": str(root), **fields}
+
+
+def _open_run(root):
+    return executions.start(root, "a run", session="s1")
+
+
+def _events(root):
+    return executions.load(root)[-1].events
+
+
+_GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+
+def _git(root, *args):
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True, env=_GIT_ENV)
+
+
+def _head(root):
+    return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def git_project(project):
+    """`project`, plus a real git history: N11's Bash-moves-HEAD capture needs
+    commits to diff, which `eos init` alone never makes."""
+    _git(project, "init", "-q")
+    (project / "a.txt").write_text("1\n")
+    _git(project, "add", "a.txt")
+    _git(project, "commit", "-q", "-m", "init")
+    return project
+
+
+def test_normalize_reads_claude_and_devin_field_names():
+    claude = hooks.normalize({"session_id": "s", "tool_name": "Bash", "tool_input": {"command": "ls"},
+                              "tool_use_id": "t1", "agent_id": "a", "agent_type": "Explore",
+                              "effort": {"level": "low"}, "duration_ms": 12})
+    assert (claude.command, claude.tool_use_id, claude.agent_type, claude.effort, claude.duration_ms) == \
+        ("ls", "t1", "Explore", "low", 12)
+    devin = hooks.normalize({"tool": "shell", "arguments": json.dumps({"cmd": "git status"})})
+    assert devin.command == "git status" and devin.tool == "shell"
+
+
+def test_a_raw_command_a_capability_covers_is_a_bypass_with_one_hint_per_session(project, monkeypatch, capsys):
+    _open_run(project)
+    first = _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "curl -s https://tracker.example/api/1"},
+        tool_use_id="t1"))
+    second = _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "curl https://tracker.example/api/2"},
+        tool_use_id="t2"))
+
+    context = json.loads(first.out)["hookSpecificOutput"]
+    assert context["hookEventName"] == "PostToolUse"
+    assert "scripts/tracker.sh" in context["additionalContext"]
+    assert second.out == "" and first.err == "" and second.err == ""
+    assert [(e.tool, e.status, e.source) for e in _events(project)] == \
+        [("curl", "bypass", "hook"), ("curl", "bypass", "hook")]
+
+
+def test_a_subagent_gets_its_own_hint(project, monkeypatch, capsys):
+    raw = {"command": "curl https://tracker.example/x"}
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_input=raw, tool_use_id="t1"))
+    inside = _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input=raw, tool_use_id="t2", agent_id="a1", agent_type="Explore"))
+    assert "tracker.sh" in inside.out
+
+
+def test_the_same_call_reported_twice_is_one_event(project, monkeypatch, capsys):
+    _open_run(project)
+    payload = _payload(project, tool_name="Bash", tool_input={"command": "cd sub && git commit -m x && ls"},
+                       tool_use_id="t1")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    assert [(e.tool, e.body, e.tool_use_id) for e in _events(project)] == [("git", "commit", "t1")]
+
+
+def test_read_only_programs_and_registered_wrappers_are_not_recorded(project, monkeypatch, capsys):
+    _open_run(project)
+    for index, command in enumerate(("ls -la && cat x | grep y", "git status", "scripts/tracker.sh issue A-1")):
+        _hook(monkeypatch, capsys, "post-tool", _payload(
+            project, tool_name="Bash", tool_input={"command": command}, tool_use_id=f"t{index}"))
+    assert _events(project) == []
+
+
+def test_a_command_naming_a_wrapper_file_still_records_its_own_programs(project, monkeypatch, capsys):
+    # E1 on the host: `git add <wrapper> && git commit` named a wrapper's file, and
+    # the whole call went unrecorded -- neither git nor what it committed.
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "git add scripts/tracker.sh && git commit -m x"},
+        tool_use_id="t1"))
+    assert {e.tool for e in _events(project) if e.kind == "ran"} == {"git"}
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "scripts/tracker.sh issue A-1 && git push"},
+        tool_use_id="t2"))
+    assert [e.tool for e in _events(project) if e.kind == "ran"].count("scripts/tracker.sh") == 0
+
+
+def test_nothing_is_recorded_without_an_open_run_but_the_hint_still_arrives(project, monkeypatch, capsys):
+    out = _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "curl https://tracker.example/x"}, tool_use_id="t1"))
+    assert "tracker.sh" in out.out
+    assert executions.load(project) == []
+
+
+def test_a_failed_command_carries_its_exit_code(project, monkeypatch, capsys):
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool-failure", _payload(
+        project, tool_name="Bash", tool_input={"command": "python3 build.py"}, tool_use_id="t1",
+        error="Exit code 3", is_interrupt=False))
+    [event] = _events(project)
+    assert (event.tool, event.status, event.exit_code) == ("python3", "error", 3)
+
+
+def test_an_interrupted_call_is_not_a_failure(project, monkeypatch, capsys):
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool-failure", _payload(
+        project, tool_name="Bash", tool_input={"command": "python3 build.py"}, tool_use_id="t1",
+        error="interrupted", is_interrupt=True))
+    assert _events(project) == []
+
+
+def test_a_bash_git_command_that_moves_head_is_a_changed_event_per_file(git_project, monkeypatch, capsys):
+    # N11: a subtree pull, a merge, a checkout -- any git command that commits
+    # or checks out files -- never goes through Edit/Write, so without this
+    # the ledger's own `changed` events see none of it.
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="t1"))
+    (git_project / "b.txt").write_text("1\n")
+    (git_project / "c.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt", "c.txt")
+    _git(git_project, "commit", "-q", "-m", "subtree pull")
+
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git merge --ff-only other"}, tool_use_id="t2"))
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "b.txt"), ("bash", "c.txt")}
+
+
+def test_a_bash_git_command_reported_twice_is_still_one_changed_event_per_file(git_project, monkeypatch, capsys):
+    # ADR-026's own known hazard: a harness that registers the hook twice
+    # fires PostToolUse twice for one call. There is no `tool_use_id` here to
+    # dedup by (one call names many files); the session's own last-seen HEAD
+    # already makes a repeat of the same head-to-head transition a no-op.
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="t1"))
+    (git_project / "b.txt").write_text("1\n")
+    (git_project / "c.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt", "c.txt")
+    _git(git_project, "commit", "-q", "-m", "two files")
+    payload = _payload(git_project, tool_name="Bash",
+                       tool_input={"command": "git merge --ff-only other"}, tool_use_id="t2")
+
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "b.txt"), ("bash", "c.txt")}
+    assert len([e for e in _events(git_project) if e.kind == "changed"]) == 2
+
+
+def test_the_first_git_call_of_a_session_only_records_the_baseline(git_project, monkeypatch, capsys):
+    # Decided without asking (N11): there is no HEAD to diff from before the
+    # session's first git call, so that call's own commit is not seen -- only
+    # a later one is. A known, conservative limitation, not a crash.
+    _open_run(git_project)
+    (git_project / "b.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt")
+    _git(git_project, "commit", "-q", "-m", "first")
+
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git merge --ff-only other"}, tool_use_id="t1"))
+
+    assert [e for e in _events(git_project) if e.kind == "changed"] == []
+
+
+def test_a_bash_git_command_in_the_background_is_not_diffed(git_project, monkeypatch, capsys):
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="t1"))
+    (git_project / "b.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt")
+    _git(git_project, "commit", "-q", "-m", "two")
+
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash",
+        tool_input={"command": "git merge --ff-only other", "run_in_background": True}, tool_use_id="t2"))
+
+    assert [e for e in _events(git_project) if e.kind == "changed"] == []
+
+
+def test_bash_changed_events_are_capped(git_project, monkeypatch, capsys):
+    monkeypatch.setattr(hooks, "BASH_CHANGED_LIMIT", 1)
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="t1"))
+    (git_project / "b.txt").write_text("1\n")
+    (git_project / "c.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt", "c.txt")
+    _git(git_project, "commit", "-q", "-m", "two files")
+
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git merge --ff-only other"}, tool_use_id="t2"))
+
+    assert len([e for e in _events(git_project) if e.kind == "changed"]) == 1
+
+
+# --- E1 working-tree capture: git commands that change files without moving HEAD -----
+
+
+def test_a_stash_pop_is_a_changed_event(git_project, monkeypatch, capsys):
+    # `git stash pop` never moves HEAD, so `_bash_changed`'s HEAD-diff sees
+    # nothing -- only a working-tree snapshot taken before the call can.
+    _open_run(git_project)
+    (git_project / "a.txt").write_text("2\n")
+    _git(git_project, "stash", "push", "-q")
+    payload = _payload(git_project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1")
+
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _git(git_project, "stash", "pop", "-q")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "a.txt")}
+
+
+def test_a_checkout_of_a_path_is_a_changed_event(git_project, monkeypatch, capsys):
+    # `git checkout -- <path>` reverts a file without moving HEAD.
+    _open_run(git_project)
+    (git_project / "a.txt").write_text("dirty\n")
+    payload = _payload(git_project, tool_name="Bash",
+                       tool_input={"command": "git checkout -- a.txt"}, tool_use_id="t1")
+
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _git(git_project, "checkout", "--", "a.txt")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "a.txt")}
+
+
+def test_a_restore_of_a_path_is_a_changed_event(git_project, monkeypatch, capsys):
+    _open_run(git_project)
+    (git_project / "a.txt").write_text("dirty\n")
+    payload = _payload(git_project, tool_name="Bash",
+                       tool_input={"command": "git restore a.txt"}, tool_use_id="t1")
+
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _git(git_project, "checkout", "--", "a.txt")  # same effect as `git restore` here
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "a.txt")}
+
+
+def test_a_worktree_change_already_seen_in_the_head_diff_is_not_recorded_twice(git_project, monkeypatch, capsys):
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="t0"))
+    (git_project / "b.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt")
+    _git(git_project, "commit", "-q", "-m", "b")
+    payload = _payload(git_project, tool_name="Bash",
+                       tool_input={"command": "git reset --hard HEAD"}, tool_use_id="t1")
+
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _git(git_project, "reset", "--hard", "HEAD")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    changed = [(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"]
+    # b.txt from the earlier commit was already recorded by the HEAD-diff step
+    # (t0->t1); the reset --hard to the same HEAD adds nothing new.
+    assert changed == [("bash", "b.txt")]
+
+
+def test_worktree_capture_is_capped_by_the_same_limit(git_project, monkeypatch, capsys):
+    # Two already-tracked files, so a plain `stash push` (no `-u`) covers both
+    # -- `-u` would also sweep up the untracked `.eos/` directory itself.
+    (git_project / "b.txt").write_text("1\n")
+    _git(git_project, "add", "b.txt")
+    _git(git_project, "commit", "-q", "-m", "b")
+    monkeypatch.setattr(hooks, "BASH_CHANGED_LIMIT", 1)
+    _open_run(git_project)
+    (git_project / "a.txt").write_text("2\n")
+    (git_project / "b.txt").write_text("2\n")
+    _git(git_project, "stash", "push", "-q")
+    payload = _payload(git_project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1")
+
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _git(git_project, "stash", "pop", "-q")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+
+    assert len([e for e in _events(git_project) if e.kind == "changed"]) == 1
+
+
+def test_worktree_capture_is_a_no_op_without_a_pretool_call(git_project, monkeypatch, capsys):
+    # Every existing test above calls `post-tool` alone; a session that never
+    # gets a PreToolUse hook (an older harness, or a non-Bash matcher) must
+    # not crash or misfire on the missing snapshot.
+    _open_run(git_project)
+    (git_project / "a.txt").write_text("2\n")
+    _git(git_project, "stash", "push", "-q")
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1"))
+    assert [e for e in _events(git_project) if e.kind == "changed"] == []
+
+
+def test_worktree_capture_fails_closed_without_a_git_repo(project, monkeypatch, capsys):
+    _open_run(project)
+    payload = _payload(project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1")
+    pre = _hook(monkeypatch, capsys, "pre-tool", payload)
+    post = _hook(monkeypatch, capsys, "post-tool", payload)
+    assert pre.out == "" and pre.err == "" and post.err == ""
+    assert [e for e in _events(project) if e.kind == "changed"] == []
+
+
+def test_worktree_capture_fails_closed_without_git_installed(git_project, monkeypatch, capsys):
+    monkeypatch.setattr("shutil.which", lambda *_: None)
+    _open_run(git_project)
+    payload = _payload(git_project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1")
+    _hook(monkeypatch, capsys, "pre-tool", payload)
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    assert [e for e in _events(git_project) if e.kind == "changed"] == []
+
+
+def test_worktree_capture_fails_closed_on_a_timeout(git_project, monkeypatch, capsys):
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+    _open_run(git_project)
+    payload = _payload(git_project, tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="t1")
+    monkeypatch.setattr(subprocess, "run", boom)
+    out = _hook(monkeypatch, capsys, "pre-tool", payload)
+    assert out.out == "" and out.err == ""
+
+
+def test_a_subagents_first_git_call_does_not_inherit_the_main_sessions_baseline(git_project, monkeypatch, capsys):
+    # The per-session git-HEAD baseline used to be shared by the main session
+    # and every subagent it spawns (same session id, no locking): a
+    # subagent's *first* git call had no baseline of its own, so without
+    # per-agent keying it silently inherited the main session's baseline and
+    # misattributed the main session's already-committed file to its own call.
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="m1"))
+    (git_project / "main.txt").write_text("1\n")
+    _git(git_project, "add", "main.txt")
+    _git(git_project, "commit", "-q", "-m", "main work")
+
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline_agent"},
+        tool_use_id="a1", agent_id="ag1", agent_type="Explore"))
+
+    assert [e for e in _events(git_project) if e.kind == "changed"] == []
+
+
+def test_main_and_subagent_git_baselines_track_independently(git_project, monkeypatch, capsys):
+    _open_run(git_project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline"}, tool_use_id="m1"))
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git tag baseline2"},
+        tool_use_id="a1", agent_id="ag1", agent_type="Explore"))
+
+    (git_project / "main.txt").write_text("1\n")
+    _git(git_project, "add", "main.txt")
+    _git(git_project, "commit", "-q", "-m", "main work")
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git merge --ff-only x"}, tool_use_id="m2"))
+
+    (git_project / "sub.txt").write_text("1\n")
+    _git(git_project, "add", "sub.txt")
+    _git(git_project, "commit", "-q", "-m", "sub work")
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        git_project, tool_name="Bash", tool_input={"command": "git merge --ff-only y"},
+        tool_use_id="a2", agent_id="ag1", agent_type="Explore"))
+
+    changed = {(e.tool, e.ref) for e in _events(git_project) if e.kind == "changed"}
+    assert changed == {("bash", "main.txt"), ("bash", "sub.txt")}
+
+
+def test_an_edit_is_a_changed_event_with_the_subagent_that_made_it(project, monkeypatch, capsys):
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Edit", tool_input={"file_path": str(project / "src" / "a.py")},
+        tool_use_id="t1", agent_id="a1", agent_type="Explore"))
+    [event] = _events(project)
+    assert (event.kind, event.tool, event.ref, event.agent) == ("changed", "edit", "src/a.py", "Explore")
+
+
+def test_a_call_from_a_directory_outside_any_project_is_recorded_for_the_sessions_project(
+        project, tmp_path, monkeypatch, capsys):
+    """Measured on the host (E1): a session that had cd'd into a checkout with no
+    `.eos`, and subagents working in such checkouts, recorded nothing at all --
+    the hook looked for a project only above the call's cwd."""
+    elsewhere = tmp_path / "other-checkout"
+    elsewhere.mkdir()
+    _open_run(project)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        elsewhere, tool_name="Edit", tool_input={"file_path": str(project / "src" / "a.py")}, tool_use_id="t1"))
+    [event] = _events(project)
+    assert (event.kind, event.ref, event.tool_use_id) == ("changed", "src/a.py", "t1")
+
+
+def test_subagent_start_and_stop_are_attributed_and_the_answer_is_only_counted(project, monkeypatch, capsys):
+    _open_run(project)
+    secret = "the answer text itself"
+    _hook(monkeypatch, capsys, "subagent-start", _payload(project, agent_id="a1", agent_type="Explore"))
+    _hook(monkeypatch, capsys, "subagent-stop", _payload(
+        project, agent_id="a1", agent_type="Explore",
+        last_assistant_message=f"{secret}: core/x.py:12 and [y](src/y.py#L4)"))
+    start, stop = _events(project)
+    assert (start.kind, start.tool, start.target, start.ref, start.agent) == \
+        ("called", "subagent", "explore", "agent:a1", None)
+    assert (stop.kind, stop.body, stop.agent) == ("verified", "2 citation(s) in its answer", "Explore")
+    assert secret not in executions.path_for(project).read_text(encoding="utf-8")
+
+
+def test_instructions_loaded_are_logged_relative_to_the_project(project, monkeypatch, capsys):
+    _hook(monkeypatch, capsys, "instructions-loaded", _payload(
+        project, file_path=str(project / ".claude" / "rules" / "x.md"), load_reason="path_glob_match",
+        memory_type="Project", trigger_file_path=str(project / "data" / "a.txt")))
+    [line] = (project / ".eos" / "data" / "loaded.jsonl").read_text(encoding="utf-8").splitlines()
+    entry = json.loads(line)
+    assert (entry["path"], entry["load_reason"], entry["trigger"]) == \
+        (".claude/rules/x.md", "path_glob_match", "data/a.txt")
+
+
+def test_session_end_writes_one_summary_and_clears_the_session_state(project, monkeypatch, capsys):
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "curl https://tracker.example/x"}, tool_use_id="t1"))
+    _hook(monkeypatch, capsys, "session-end", _payload(project, reason="other"))
+    [line] = (project / ".eos" / "data" / "sessions.jsonl").read_text(encoding="utf-8").splitlines()
+    summary = json.loads(line)
+    assert summary["bypass"] == {"tracker": 1} and summary["hints"] == 1 and summary["reason"] == "other"
+    assert not hooks._state_file("s1").exists()
+
+
+def test_a_compaction_forgets_which_task_briefs_were_delivered(project, monkeypatch, capsys):
+    seen = hooks._prompted_file("s1")
+    seen.parent.mkdir(parents=True, exist_ok=True)
+    seen.write_text("digest\n", encoding="utf-8")
+    _hook(monkeypatch, capsys, "session-start", _payload(project, source="compact"))
+    assert not seen.exists()
+
+
+def test_brief_off_in_config_silences_the_brief_but_not_the_capture(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[hooks]\nbrief = false\n", encoding="utf-8")
+    _open_run(project)
+    work_payload = _payload(project, source="startup")
+    assert _hook(monkeypatch, capsys, "session-start", work_payload).out == ""
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": "python3 x.py"}, tool_use_id="t1"))
+    assert [e.tool for e in _events(project)] == ["python3"]
+
+
+def test_stop_asks_once_about_runs_left_open(project, monkeypatch, capsys):
+    record = _open_run(project)
+    out = _hook(monkeypatch, capsys, "stop", _payload(project))
+    answer = json.loads(out.out)
+    assert answer["decision"] == "block" and record.id in answer["reason"]
+    again = _hook(monkeypatch, capsys, "stop", _payload(project, stop_hook_active=True))
+    assert again.out == ""
+
+
+def test_stop_asks_about_a_run_recorded_in_a_workspace_projects_ledger(project, tmp_path, monkeypatch, capsys):
+    service = tmp_path / "service"
+    service.mkdir()
+    assert subprocess.run(EOS + ["init", str(service), "--no-ai"], capture_output=True).returncode == 0
+    record = executions.start(service, "routed from the workspace", session="s1")
+    answer = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)
+    assert answer["decision"] == "block" and record.id in answer["reason"]
+
+
+def test_stop_close_off_in_config_never_blocks(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[hooks]\nclose = false\n", encoding="utf-8")
+    _open_run(project)
+    assert _hook(monkeypatch, capsys, "stop", _payload(project)).out == ""
+
+
+def test_the_routing_hook_records_in_dry_run_and_applies_when_live(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    base = config.read_text(encoding="utf-8")
+    config.write_text(base + "\n[model_routing]\nhook = true\n", encoding="utf-8")
+    _open_run(project)
+    call = _payload(project, tool_name="Agent", tool_use_id="t1",
+                    tool_input={"prompt": "design the service boundary for billing", "subagent_type": ""})
+    assert _hook(monkeypatch, capsys, "pre-agent", call).out == ""
+    assert any(e.kind == "decided" and (e.body or "").startswith("dry run") for e in _events(project))
+
+    config.write_text(base + "\n[model_routing]\nhook = true\nhook_dry_run = false\n", encoding="utf-8")
+    live = json.loads(_hook(monkeypatch, capsys, "pre-agent", call).out)
+    assert live["hookSpecificOutput"]["updatedInput"]["model"] in hooks.SUBAGENT_MODELS
+
+
+def test_the_routing_hook_decides_on_the_first_2000_characters_only(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[model_routing]\nhook = true\n", encoding="utf-8")
+    _open_run(project)
+    filler = "note " * (hooks.MAX_TASK_CHARS // 5)
+    assert len(filler) == hooks.MAX_TASK_CHARS
+    words = "design the service boundary for billing"
+    for number, prompt in enumerate((filler, filler + words, words + " " + filler)):
+        _hook(monkeypatch, capsys, "pre-agent", _payload(
+            project, tool_name="Agent", tool_use_id=f"b{number}", tool_input={"prompt": prompt}))
+    bodies = [e.body.split("(")[1] for e in _events(project) if e.kind == "decided"]
+    assert len(bodies) == 3
+    # Words past the cut do not reach the decision; the same words inside it do.
+    assert bodies[1] == bodies[0] and bodies[2] != bodies[0]
+
+
+def test_a_named_subagent_or_an_explicit_model_is_never_routed(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[model_routing]\nhook = true\n"
+                      "hook_dry_run = false\n", encoding="utf-8")
+    for tool_input in ({"prompt": "x", "subagent_type": "Explore"}, {"prompt": "x", "model": "haiku"}):
+        assert _hook(monkeypatch, capsys, "pre-agent", _payload(
+            project, tool_name="Agent", tool_input=tool_input)).out == ""
+
+
+def test_a_named_subagent_type_in_route_types_is_routed_when_it_has_no_model(project, monkeypatch, capsys):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[model_routing]\nhook = true\n"
+                      "hook_dry_run = false\nroute_types = [\"Explore\"]\n", encoding="utf-8")
+    prompt = "design the service boundary for billing"
+    routed = json.loads(_hook(monkeypatch, capsys, "pre-agent", _payload(
+        project, tool_name="Agent", tool_input={"prompt": prompt, "subagent_type": "Explore"})).out)
+    updated = routed["hookSpecificOutput"]["updatedInput"]
+    assert updated["model"] in hooks.SUBAGENT_MODELS and updated["subagent_type"] == "Explore"
+    for tool_input in ({"prompt": prompt, "subagent_type": "Plan"},
+                       {"prompt": prompt, "subagent_type": "Explore", "model": "haiku"}):
+        assert _hook(monkeypatch, capsys, "pre-agent", _payload(
+            project, tool_name="Agent", tool_input=tool_input)).out == ""
+
+
+@pytest.mark.parametrize("stdin", ["", "not json", "[1, 2]", '{"cwd": "/nonexistent/path"}'])
+def test_anything_malformed_exits_zero_silently(project, monkeypatch, capsys, stdin):
+    for event in hooks.EVENTS + ("no-such-event",):
+        out = _hook(monkeypatch, capsys, event, stdin)
+        assert out.out == "" and out.err == ""
+
+
+def test_the_cli_dispatches_hook_before_the_heavy_imports(project, tmp_path):
+    payload = json.dumps(_payload(project, tool_name="Bash", tool_input={"command": "curl https://tracker.example/"}))
+    done = subprocess.run(EOS + ["hook", "post-tool"], input=payload, capture_output=True, text=True,
+                          env={"EOS_STATE_DIR": str(tmp_path / "state2"), "PATH": "/usr/bin:/bin"})
+    assert done.returncode == 0 and done.stderr == ""
+    assert "tracker.sh" in done.stdout
+
+
+# --- the context diet (ADR-027) ------------------------------------------------------
+
+
+def _hooks_config(project, text):
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[hooks]\n" + text, encoding="utf-8")
+
+
+def test_a_long_unranged_read_gets_the_outline_once_then_passes(project, monkeypatch, capsys):
+    _hooks_config(project, "outline_lines = 10\n")
+    target = project / "notes.md"
+    target.write_text("# Title\n" + "text\n" * 20 + "## Part two\n```\n# not a heading\n```\n" + "more\n" * 5,
+                      encoding="utf-8")
+    read = _payload(project, tool_name="Read", tool_input={"file_path": str(target)})
+    first = json.loads(_hook(monkeypatch, capsys, "pre-read", read).out)["hookSpecificOutput"]
+    assert first["permissionDecision"] == "deny"
+    reason = first["permissionDecisionReason"]
+    assert "1: # Title" in reason and "22: ## Part two" in reason and "not a heading" not in reason
+    assert "limit: 30" in reason
+    assert _hook(monkeypatch, capsys, "pre-read", read).out == ""      # asking again reads it
+    ranged = _payload(project, tool_name="Read", tool_input={"file_path": str(target), "limit": 5})
+    assert _hook(monkeypatch, capsys, "pre-read", ranged).out == ""
+    inside = _payload(project, tool_name="Read", agent_id="a1", tool_input={"file_path": str(project / "x")})
+    assert _hook(monkeypatch, capsys, "pre-read", inside).out == ""
+
+
+def test_the_outline_gate_is_off_unless_configured(project, monkeypatch, capsys):
+    target = project / "big.py"
+    target.write_text("def f():\n    pass\n" * 500, encoding="utf-8")
+    read = _payload(project, tool_name="Read", tool_input={"file_path": str(target)})
+    assert _hook(monkeypatch, capsys, "pre-read", read).out == ""
+
+
+def test_a_shell_rewrite_of_a_file_the_session_read_is_named_once(project, monkeypatch, capsys):
+    import os
+
+    target = project / "app.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Read",
+                                                     tool_input={"file_path": str(target)}))
+    bash = _payload(project, tool_name="Bash", tool_input={"command": "python3 fix.py"}, tool_use_id="b1")
+    assert _hook(monkeypatch, capsys, "post-tool", bash).out == ""
+    os.utime(target, (target.stat().st_atime, target.stat().st_mtime + 5))
+    hint = json.loads(_hook(monkeypatch, capsys, "post-tool", bash).out)["hookSpecificOutput"]["additionalContext"]
+    assert "app.py" in hint and "Edit tool" in hint
+    os.utime(target, (target.stat().st_atime, target.stat().st_mtime + 5))
+    assert _hook(monkeypatch, capsys, "post-tool", bash).out == ""      # once per session
+
+
+def test_an_edit_through_the_edit_tool_is_not_a_shell_rewrite(project, monkeypatch, capsys):
+    import os
+
+    target = project / "app.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Read",
+                                                     tool_input={"file_path": str(target)}))
+    os.utime(target, (target.stat().st_atime, target.stat().st_mtime + 5))
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit",
+                                                     tool_input={"file_path": str(target)}))
+    bash = _payload(project, tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b2")
+    assert _hook(monkeypatch, capsys, "post-tool", bash).out == ""
+
+
+def _transcript(tmp_path, tokens):
+    path = tmp_path / "t.jsonl"
+    path.write_text(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n"
+                    + json.dumps({"type": "assistant", "message": {"usage": {
+                        "input_tokens": 1, "cache_read_input_tokens": tokens,
+                        "cache_creation_input_tokens": 0}}}) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_closing_a_run_in_a_large_context_suggests_clear(project, tmp_path, monkeypatch, capsys):
+    finish = {"command": "eos run finish . x-a-run-0000 --outcome ok"}
+    big = _payload(project, tool_name="Bash", tool_input=finish, transcript_path=_transcript(tmp_path, 400_000))
+    hint = json.loads(_hook(monkeypatch, capsys, "post-tool", big).out)["hookSpecificOutput"]["additionalContext"]
+    assert "~400k tokens" in hint and "/clear" in hint
+    small = _payload(project, tool_name="Bash", tool_input=finish, transcript_path=_transcript(tmp_path, 50_000))
+    assert _hook(monkeypatch, capsys, "post-tool", small).out == ""
+    _hooks_config(project, "clear_hint_tokens = 0\n")
+    assert _hook(monkeypatch, capsys, "post-tool", big).out == ""
+
+
+def _prompt(project, tmp_path, tokens, prompt="carry on with the order flow"):
+    return _payload(project, prompt=prompt, transcript_path=_transcript(tmp_path, tokens))
+
+
+def test_a_prompt_past_the_pressure_line_with_a_run_open_suggests_compact_once(
+        project, tmp_path, monkeypatch, capsys):
+    _hooks_config(project, "pressure_tokens = 300000\n")
+    _open_run(project)
+    assert "/compact" not in _hook(monkeypatch, capsys, "user-prompt", _prompt(project, tmp_path, 200_000)).out
+    hint = _hook(monkeypatch, capsys, "user-prompt", _prompt(project, tmp_path, 320_000)).out
+    assert "~320k tokens" in hint and "/compact" in hint
+    again = _hook(monkeypatch, capsys, "user-prompt", _prompt(project, tmp_path, 340_000, "next step")).out
+    assert "/compact" not in again                                            # once per session
+
+
+def test_the_pressure_line_is_off_by_default_and_without_an_open_run(project, tmp_path, monkeypatch, capsys):
+    _open_run(project)
+    assert "/compact" not in _hook(monkeypatch, capsys, "user-prompt", _prompt(project, tmp_path, 900_000)).out
+    executions.finish(project, executions.load(project)[-1].id, outcome="ok")
+    _hooks_config(project, "pressure_tokens = 300000\n")
+    assert "/compact" not in _hook(monkeypatch, capsys, "user-prompt", _prompt(project, tmp_path, 900_000)).out
+
+
+def test_closing_another_sessions_run_while_this_one_stays_open_suggests_no_clear(
+        project, tmp_path, monkeypatch, capsys):
+    """Measured: abandoning 19 stale runs of other sessions said "/clear before
+    the next task is safe" each time while this session's own run stayed open."""
+    mine = _open_run(project)
+    stale = executions.start(project, "an old run", session="s-old")
+    executions.finish(project, stale.id, outcome="abandoned")
+    finish = {"command": f"eos run finish . {stale.id} --outcome abandoned"}
+    big = _payload(project, tool_name="Bash", tool_input=finish, transcript_path=_transcript(tmp_path, 400_000))
+    out = _hook(monkeypatch, capsys, "post-tool", big).out
+    assert "/clear" not in out
+    executions.finish(project, mine.id, outcome="ok")
+    own = {"command": f"eos run finish . {mine.id} --outcome ok"}
+    big = _payload(project, tool_name="Bash", tool_input=own, transcript_path=_transcript(tmp_path, 400_000))
+    hint = json.loads(_hook(monkeypatch, capsys, "post-tool", big).out)["hookSpecificOutput"]["additionalContext"]
+    assert "/clear before the next task is safe" in hint
+
+
+def test_compaction_is_told_what_to_keep_and_the_summary_is_checked(project, monkeypatch, capsys):
+    run = _open_run(project)
+    target = project / "service.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit",
+                                                     tool_input={"file_path": str(target)}))
+    instructions = _hook(monkeypatch, capsys, "pre-compact", _payload(project, trigger="auto")).out
+    assert run.id in instructions and "service.py" in instructions
+    assert "Drop raw tool output" in instructions
+    _hook(monkeypatch, capsys, "post-compact", _payload(project, compact_summary=f"worked on {run.id}"))
+    [checked] = [line for line in hooks._state("s1") if "missing" in line]
+    assert checked["missing"] == ["service.py"] and checked["expected"] == 2
+
+
+def test_after_compaction_the_session_gets_back_what_it_holds(project, monkeypatch, capsys):
+    _hooks_config(project, "brief = false\n")
+    run = _open_run(project)
+    out = _hook(monkeypatch, capsys, "session-start", _payload(project, source="compact")).out
+    assert "kept across the compaction" in out and run.id in out
+    assert _hook(monkeypatch, capsys, "session-start", _payload(project, source="startup")).out == ""
+
+
+def test_the_session_summary_keeps_the_context_diet_evidence(project, monkeypatch, capsys):
+    _hooks_config(project, "outline_lines = 5\n")
+    target = project / "long.md"
+    target.write_text("# A\n" + "x\n" * 10, encoding="utf-8")
+    _hook(monkeypatch, capsys, "pre-read", _payload(project, tool_name="Read", tool_input={"file_path": str(target)}))
+    _hook(monkeypatch, capsys, "pre-compact", _payload(project))
+    _hook(monkeypatch, capsys, "post-compact", _payload(project, compact_summary="nothing"))
+    _hook(monkeypatch, capsys, "session-end", _payload(project, reason="other"))
+    entry = json.loads((project / ".eos" / "data" / "sessions.jsonl").read_text().splitlines()[-1])
+    assert entry["outlined"] == 1 and entry["compactions"] == [{"expected": 0, "missing": []}]
+
+
+# --- verified completion (ADR-028) ---------------------------------------------------
+
+VERIFY = r'''
+[[scope]]
+name = "code"
+paths = ["src/**"]
+passes = ['make\s+test\b']
+run = "make test"
+'''
+
+
+def _verify_project(project):
+    (project / ".eos" / "knowledge" / "verify.toml").write_text(VERIFY, encoding="utf-8")
+    source = project / "src" / "a.py"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text("x = 1\n", encoding="utf-8")
+    return source
+
+
+def test_a_change_and_the_check_that_passes_after_it_are_recorded(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    run = _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", agent_id="sub1",
+                                                     tool_input={"file_path": str(source)}))
+    assert hooks._verify_events("s1")[-1] == ("changed", str(source))
+    _hook(monkeypatch, capsys, "post-tool-failure", _payload(project, tool_name="Bash", error="Exit code 1",
+                                                             tool_input={"command": "make test"}, tool_use_id="f1"))
+    assert ("passed", "code") not in hooks._verify_events("s1")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="p1",
+                                                     tool_input={"command": "make test"}))
+    assert hooks._verify_events("s1")[-1] == ("passed", "code")
+    assert [e.ref for e in executions.load(project)[-1].events if e.kind == "verified"] == ["code"]
+    assert run.id == executions.load(project)[-1].id
+
+
+def test_stop_asks_once_about_a_change_not_checked_since(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    _hooks_config(project, "close = false\n")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    first = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)
+    assert first["decision"] == "block" and "code: make test" in first["reason"]
+    assert _hook(monkeypatch, capsys, "stop", _payload(project)).out == ""          # same set: once
+    assert _hook(monkeypatch, capsys, "stop", _payload(project, stop_hook_active=True)).out == ""
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="t9",
+                                                     tool_input={"command": "make test"}))
+    _hook(monkeypatch, capsys, "session-end", _payload(project, reason="other"))
+    entry = json.loads((project / ".eos" / "data" / "sessions.jsonl").read_text().splitlines()[-1])
+    assert entry["verify_gates"] == 1 and entry["verify_after_gate"] == 1
+
+
+def test_stop_is_silent_without_scopes_or_for_unscoped_files(project, monkeypatch, capsys):
+    _hooks_config(project, "close = false\n")
+    notes_file = project / "notes.md"
+    notes_file.write_text("x", encoding="utf-8")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(notes_file)}))
+    assert _hook(monkeypatch, capsys, "stop", _payload(project)).out == ""        # no verify.toml
+    _verify_project(project)
+    assert _hook(monkeypatch, capsys, "stop", _payload(project)).out == ""        # notes.md is in no scope
+
+
+def test_the_verify_gate_and_the_open_run_gate_share_one_block(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    run = _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    reason = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)["reason"]
+    assert "not verified yet" in reason and run.id in reason
+
+
+# --- A2: verify_depth's one consumer (Day 4) --------------------------------------------
+
+
+def _procedure_with_readonly_success(project):
+    out = subprocess.run(EOS + ["procedure", "new", str(project), "--title", "Ship it", "--steps", "-",
+                                "--success", "`python3 -c \"print(1)\"` prints 1 (read-only)"],
+                         input="Do it\n", capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.split("\t")[0]
+
+
+def _decide(project, run_id, level, *, session="s1"):
+    executions.event(project, run_id, kind="decided", tool="route", ref="route:abc123",
+                     body=f"coding {level} claude-sonnet-5 - flag 0.8000 0.90", session=session)
+
+
+def test_depth_2_names_the_procedures_read_only_success_check(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    slug = _procedure_with_readonly_success(project)
+    run = executions.start(project, "ship it", procedure=slug, session="s1")
+    _decide(project, run.id, "HIGH")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    reason = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)["reason"]
+    assert f"eos verify --procedure {slug}" in reason
+
+
+def test_depth_0_adds_nothing_the_gate_did_not_already_say(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    slug = _procedure_with_readonly_success(project)
+    run = executions.start(project, "ship it", procedure=slug, session="s1")
+    _decide(project, run.id, "LOW")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    reason = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)["reason"]
+    assert "eos verify --procedure" not in reason
+
+
+def test_no_routed_decision_never_makes_the_gate_stricter(project, monkeypatch, capsys):
+    """No open run at all: the gate's text is exactly what it was before A2 --
+    nothing added, nothing new triggered."""
+    source = _verify_project(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    reason = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)["reason"]
+    assert "eos verify --procedure" not in reason
+
+
+def test_a_run_that_never_routed_adds_no_hint_either(project, monkeypatch, capsys):
+    """A run following a procedure with read-only checks, but with no
+    `decided` event at all (no routing configured): still nothing added."""
+    source = _verify_project(project)
+    slug = _procedure_with_readonly_success(project)
+    executions.start(project, "ship it", procedure=slug, session="s1")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    reason = json.loads(_hook(monkeypatch, capsys, "stop", _payload(project)).out)["reason"]
+    assert "eos verify --procedure" not in reason
+
+
+# --- subagent handoff (2.x roadmap C6) and whole updatedInput ---------------------------
+
+
+def test_a_routed_call_keeps_every_field_it_was_given(project, monkeypatch, capsys):
+    """The harness takes updatedInput as the tool input: sending only the model
+    would have dropped the prompt of every routed subagent call."""
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[model_routing]\nhook = true\nhook_dry_run = false\n",
+                      encoding="utf-8")
+    call = _payload(project, tool_name="Agent", tool_use_id="w1",
+                    tool_input={"prompt": "design the service boundary for billing", "description": "design",
+                                "subagent_type": ""})
+    updated = json.loads(_hook(monkeypatch, capsys, "pre-agent", call).out)["hookSpecificOutput"]["updatedInput"]
+    assert updated["prompt"] == "design the service boundary for billing" and updated["description"] == "design"
+    assert updated["model"] in hooks.SUBAGENT_MODELS
+
+
+def test_the_handoff_is_appended_to_a_subagent_prompt_when_turned_on(project, monkeypatch, capsys):
+    _hooks_config(project, "handoff_tokens = 400\n")
+    run = _open_run(project)
+    call = _payload(project, tool_name="Agent", tool_use_id="h1",
+                    tool_input={"prompt": "check the tracker ticket for the release", "subagent_type": "Explore"})
+    updated = json.loads(_hook(monkeypatch, capsys, "pre-agent", call).out)["hookSpecificOutput"]["updatedInput"]
+    assert updated["prompt"].startswith("check the tracker ticket for the release")
+    assert "EOS handoff" in updated["prompt"] and run.id in updated["prompt"]
+    assert "scripts/tracker.sh" in updated["prompt"] and updated["subagent_type"] == "Explore"
+
+
+def test_the_subagent_suffix_ends_every_subagent_prompt(project, monkeypatch, capsys):
+    """A host rule every subagent must carry (the language its report is read
+    in) rides on the prompt itself: subagents get no prompt hook."""
+    _hooks_config(project, 'subagent_suffix = "Final report in Turkish."\n')
+    call = _payload(project, tool_name="Agent", tool_use_id="s1",
+                    tool_input={"prompt": "check the tracker ticket", "subagent_type": "Explore"})
+    updated = json.loads(_hook(monkeypatch, capsys, "pre-agent", call).out)["hookSpecificOutput"]["updatedInput"]
+    assert updated["prompt"] == "check the tracker ticket\n\nFinal report in Turkish."
+    assert updated["subagent_type"] == "Explore"
+
+
+def test_the_subagent_suffix_is_not_added_twice(project, monkeypatch, capsys):
+    _hooks_config(project, 'subagent_suffix = "Final report in Turkish."\n')
+    call = _payload(project, tool_name="Agent", tool_input={
+        "prompt": "check the tracker ticket. Final report in Turkish.", "subagent_type": "Explore"})
+    assert _hook(monkeypatch, capsys, "pre-agent", call).out == ""
+
+
+def test_no_handoff_unless_configured(project, monkeypatch, capsys):
+    _open_run(project)
+    call = _payload(project, tool_name="Agent", tool_input={"prompt": "check the tracker ticket", "subagent_type": "Explore"})
+    assert _hook(monkeypatch, capsys, "pre-agent", call).out == ""
+
+
+def test_a_subagent_citing_a_line_that_is_not_there_is_asked_once(project, monkeypatch, capsys):
+    source = project / "svc.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    stop = _payload(project, agent_id="a1", agent_type="Explore",
+                    last_assistant_message=f"The value is set at {source}:120.")
+    first = json.loads(_hook(monkeypatch, capsys, "subagent-stop", stop).out)
+    assert first["decision"] == "block" and "the file has 1 lines" in first["reason"]
+    assert _hook(monkeypatch, capsys, "subagent-stop", stop).out == ""                   # once
+    fine = _payload(project, agent_id="a2", agent_type="Explore", last_assistant_message=f"See {source}:1.")
+    assert _hook(monkeypatch, capsys, "subagent-stop", fine).out == ""
+
+
+# --- review findings (branch review, 2026-09-27) ---------------------------------------
+
+
+def test_a_check_started_in_the_background_is_not_a_pass(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="bg1",
+                                                     tool_input={"command": "make test", "run_in_background": True}))
+    assert ("passed", "code") not in hooks._verify_events("s1")
+
+
+def test_a_file_that_changed_under_the_session_does_not_stop_it(project, monkeypatch, capsys):
+    """A pull, an editor or another session moves an mtime as well; only the
+    session's own edits are its work (the hint about shell rewrites stays)."""
+    import os
+
+    source = _verify_project(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Read", tool_input={"file_path": str(source)}))
+    os.utime(source, (source.stat().st_atime, source.stat().st_mtime + 5))
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="g1",
+                                                     tool_input={"command": "git pull --ff-only"}))
+    _hooks_config(project, "close = false\n")
+    assert _hook(monkeypatch, capsys, "stop", _payload(project)).out == ""
+
+
+def test_a_handoff_is_not_made_into_a_whole_prompt(project, monkeypatch, capsys):
+    _hooks_config(project, "handoff_tokens = 400\n")
+    _open_run(project)
+    call = _payload(project, tool_name="Agent", tool_input={"description": "check the tracker ticket",
+                                                            "subagent_type": "Explore"})
+    assert _hook(monkeypatch, capsys, "pre-agent", call).out == ""
+
+
+def test_the_main_session_citing_a_line_that_is_not_there_is_asked_once(project, monkeypatch, capsys):
+    source = project / "svc.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    stop = _payload(project, last_assistant_message=f"Fixed at {source}:120.")
+    first = json.loads(_hook(monkeypatch, capsys, "stop", stop).out)
+    assert first["decision"] == "block" and "the file has 1 lines" in first["reason"]
+    assert _hook(monkeypatch, capsys, "stop", stop).out == ""                              # once
+    assert _hook(monkeypatch, capsys, "stop", _payload(project, last_assistant_message=f"See {source}:1.")).out == ""
+
+
+def test_the_main_session_citation_check_follows_cite_check(project, monkeypatch, capsys):
+    source = project / "svc.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    config = project / ".eos" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[hooks]\ncite_check = false\n", encoding="utf-8")
+    stop = _payload(project, last_assistant_message=f"Fixed at {source}:120.")
+    assert _hook(monkeypatch, capsys, "stop", stop).out == ""
+
+
+def test_a_check_run_so_it_cannot_count_gets_one_hint_at_once(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    piped = _payload(project, tool_name="Bash", tool_use_id="b1", tool_input={"command": "make test | tail -3"})
+    out = _hook(monkeypatch, capsys, "post-tool", piped).out
+    assert "does not count" in out and "make test" in out
+    again = _payload(project, tool_name="Bash", tool_use_id="b2", tool_input={"command": "make test; echo x"})
+    assert "does not count" not in _hook(monkeypatch, capsys, "post-tool", again).out   # once
+
+
+def test_a_subagent_does_not_use_up_the_main_sessions_verify_hint(project, monkeypatch, capsys):
+    source = _verify_project(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    sub = _payload(project, tool_name="Bash", tool_use_id="s1", agent_id="a1", agent_type="Explore",
+                   tool_input={"command": "make test | tail -3"})
+    _hook(monkeypatch, capsys, "post-tool", sub)
+    main = _payload(project, tool_name="Bash", tool_use_id="m1", tool_input={"command": "make test | tail -3"})
+    assert "does not count" in _hook(monkeypatch, capsys, "post-tool", main).out
+
+
+def test_a_pass_of_another_scope_does_not_answer_a_gate(project, monkeypatch, capsys):
+    (project / ".eos" / "knowledge" / "verify.toml").write_text(
+        VERIFY + '\n[[scope]]\nname = "docs"\npaths = ["docs/**"]\npasses = [\'make\\s+docs\\b\']\nrun = "make docs"\n',
+        encoding="utf-8")
+    (project / "src").mkdir(exist_ok=True)
+    (project / "docs").mkdir(exist_ok=True)
+    code, page = project / "src" / "a.py", project / "docs" / "p.md"
+    code.write_text("x = 1\n", encoding="utf-8")
+    page.write_text("x\n", encoding="utf-8")
+    _hooks_config(project, "close = false\n")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(code)}))
+    _hook(monkeypatch, capsys, "stop", _payload(project))                                   # gated on code
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(page)}))
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="d1",
+                                                     tool_input={"command": "make docs"}))
+    _hook(monkeypatch, capsys, "session-end", _payload(project, reason="other"))
+    entry = json.loads((project / ".eos" / "data" / "sessions.jsonl").read_text().splitlines()[-1])
+    assert entry["verify_gates"] == 1 and entry["verify_after_gate"] == 0
+
+
+def test_a_gate_on_a_key_with_a_bar_is_answered_by_its_pass(project, monkeypatch, capsys):
+    (project / ".eos" / "knowledge" / "verify.toml").write_text(
+        '[[scope]]\nname = "svc"\npaths = ["src/{part}/**"]\npasses = [\'make\\s+test\\b\']\nrun = "make test"\n',
+        encoding="utf-8")
+    source = project / "src" / "a|b" / "x.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("x = 1\n", encoding="utf-8")
+    _hooks_config(project, "close = false\n")
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Edit", tool_input={"file_path": str(source)}))
+    _hook(monkeypatch, capsys, "stop", _payload(project))
+    _hook(monkeypatch, capsys, "post-tool", _payload(project, tool_name="Bash", tool_use_id="k1",
+                                                     tool_input={"command": "make test"}))
+    _hook(monkeypatch, capsys, "session-end", _payload(project, reason="other"))
+    entry = json.loads((project / ".eos" / "data" / "sessions.jsonl").read_text().splitlines()[-1])
+    assert entry["verify_gates"] == 1 and entry["verify_after_gate"] == 1
+
+
+# --- note reads (2.x roadmap M6, ADR-036) -------------------------------------------
+
+
+def _store_note(root, name="20260901-a-note.md"):
+    store = root / ".eos" / "knowledge"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / name).write_text("---\nkind: finding\ntitle: A note\ncreated: 2026-09-01\n---\n\nBody.\n",
+                              encoding="utf-8")
+    return store / name
+
+
+def test_reading_a_note_file_is_a_read_event_naming_the_note(project, monkeypatch, capsys):
+    note = _store_note(project)
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Read", tool_input={"file_path": str(note)}, tool_use_id="t1"))
+    [event] = _events(project)
+    # No tool: a note read is not a tool the run used, and must not satisfy a
+    # procedure's Success check or sit on a step (ADR-031) by its name.
+    assert (event.kind, event.tool, event.ref) == ("read", None, f"note:{note.name}")
+
+
+def test_reading_a_file_that_is_not_a_note_records_nothing(project, monkeypatch, capsys):
+    (project / "src").mkdir()
+    (project / "src" / "README.md").write_text("# not a note\n", encoding="utf-8")
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Read", tool_input={"file_path": str(project / "src" / "README.md")}, tool_use_id="t1"))
+    assert _events(project) == []
+
+
+def test_a_shell_command_printing_a_note_is_a_read_event(project, monkeypatch, capsys):
+    note = _store_note(project)
+    _open_run(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Bash", tool_input={"command": f"cat .eos/knowledge/{note.name} | head -40"},
+        tool_use_id="t1"))
+    assert [(e.kind, e.ref) for e in _events(project)] == [("read", f"note:{note.name}")]
+
+
+def test_a_note_read_without_an_open_run_records_nothing(project, monkeypatch, capsys):
+    note = _store_note(project)
+    _hook(monkeypatch, capsys, "post-tool", _payload(
+        project, tool_name="Read", tool_input={"file_path": str(note)}, tool_use_id="t1"))
+    assert executions.load(project) == []
+
+
+def test_the_same_note_read_reported_twice_is_one_event(project, monkeypatch, capsys):
+    note = _store_note(project)
+    _open_run(project)
+    payload = _payload(project, tool_name="Bash", tool_input={"command": f"cat {note}"}, tool_use_id="t1")
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    _hook(monkeypatch, capsys, "post-tool", payload)
+    assert [(e.kind, e.ref) for e in _events(project)] == [("read", f"note:{note.name}")]
+
+
+# --- a brief section already in this context is not sent again ------------------------
+
+
+def _briefs(monkeypatch, texts):
+    from core import brief
+
+    queue = list(texts)
+    monkeypatch.setattr(brief, "build", lambda *a, **k: queue.pop(0) if queue else "")
+
+
+def test_a_prompt_brief_leaves_out_a_section_this_context_already_has(project, monkeypatch, capsys):
+    """Measured on a host: 21% of 203 briefs' text repeated a section the same
+    session had already been given word for word -- a reused ROUTE, the same
+    procedure, the 'Record this run' line -- because one changed section made
+    the whole brief new."""
+    head = "EOS brief for this task — proj"
+    route = "ROUTE  bugfix LOW → haiku/low\n  Apply: Agent({model: \"haiku\"})"
+    record = "Record this run: eos run start . --title \"…\""
+    _briefs(monkeypatch, [f"{head}\n\nLAST RUNS\n  run a\n\n{record}\n\n{route}",
+                          f"{head}\n\nLAST RUNS\n  run b\n\n{record}\n\n{route}"])
+
+    first = _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="fix the order flow")).out
+    second = _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="now fix the refund flow")).out
+
+    assert "ROUTE  bugfix" in first and "Record this run" in first
+    assert "run b" in second and head in second
+    assert "ROUTE  bugfix" not in second and "Record this run:" not in second
+    assert "As given earlier in this conversation: Record this run, ROUTE" in second
+
+
+def test_a_brief_with_nothing_new_but_its_header_sends_nothing(project, monkeypatch, capsys):
+    head = "EOS brief for this task — proj"
+    _briefs(monkeypatch, [f"{head}\n\nROUTE  a\n\nPROCEDURE  p", f"{head}  \n\nPROCEDURE  p\n\nROUTE  a"])
+
+    _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="first task words"))
+    assert _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="second task words")).out == ""
+
+
+def test_after_a_compaction_the_sections_arrive_again(project, monkeypatch, capsys):
+    head = "EOS brief for this task — proj"
+    _briefs(monkeypatch, [f"{head}\n\nROUTE  a\n\nLAST RUNS  1", "", f"{head}\n\nROUTE  a\n\nLAST RUNS  2"])
+
+    _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="first task words"))
+    _hook(monkeypatch, capsys, "session-start", _payload(project, source="compact"))
+    again = _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt="second task words")).out
+
+    assert "ROUTE  a" in again
+
+
+def test_a_message_the_harness_relays_gets_no_brief(project, monkeypatch, capsys):
+    """A subagent's hand-back reached the prompt hook as `<agent-message from=…>`
+    and its report text matched an unrelated procedure (measured 2026-10-14)."""
+    head = "EOS brief for this task — proj"
+    _briefs(monkeypatch, [f"{head}\n\nPROCEDURE  read LLD diagrams"] * 3)
+
+    for relayed in ('<agent-message from="a40aa6f">\n[Subagent hand-back] read the LLD diagrams',
+                    '<system-reminder id="cc013a63">\nAnother Claude session sent a message',
+                    "<task-notification>\n<task-id>a1</task-id>"):
+        assert _hook(monkeypatch, capsys, "user-prompt", _payload(project, prompt=relayed)).out == ""

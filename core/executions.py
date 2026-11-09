@@ -1,0 +1,1208 @@
+"""What a session did — the execution ledger (ADR-022).
+
+Notes say what is true, the work ledger says what a session intends; this
+says what happened. One append-only file beside the other two, three line
+types, folded on read:
+
+  start   an execution opens: title, procedure, work item, session, agent,
+          target, and the branch and commit it started from
+  event   one thing the session did, as a reference: kind, tool, target, a
+          log/cache/build/file ref, exit code, duration -- never a payload
+  finish  the session declares the outcome; the commit it ended on
+
+Folding is the only way state is derived, for the reason ADR-020 gives: two
+writers appending at once both keep their line, which a rewritten record
+cannot promise. An `event` for an id with no `start` still creates the
+execution -- a lost line must not hide what happened.
+
+The outcome is what the session says. Nothing here concludes anything from
+it (ADR-018); later milestones use outcomes as observations.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import secrets
+import time
+from pathlib import Path
+
+from core import notes
+
+FILENAME = "executions.jsonl"
+# On every line since 2.x (roadmap F5): a reader can tell which writer's shape it holds.
+LEDGER_VERSION = 1
+# Past this size the ledger rotates: executions.jsonl -> executions.1.jsonl ...,
+# at most KEEP_ROTATED old files. The fold reads all of them, oldest first.
+MAX_LEDGER_BYTES = 8 * 1024 * 1024
+KEEP_ROTATED = 4
+
+KINDS = ("ran", "read", "changed", "called", "verified", "noted", "decided")
+OUTCOMES = ("ok", "failed", "abandoned")
+# Who wrote an event: a host wrapper through `eos-event`, a harness hook through
+# `eos hook`, or a person/agent through `eos run event`. Absent on lines written
+# before 1.3.0, which were all one of the first and the last.
+SOURCES = ("wrapper", "hook", "cli")
+# What became of the action, as far as the writer could see: it ran, it failed,
+# it ran around a wrapper that exists for it (`capabilities.toml`), or it could
+# not reach the system it fronts -- DNS, TLS, a refused connection, a timeout --
+# which only the wrapper can tell apart from an answer that happened to be "no"
+# (A4: `capabilities.health`).
+STATUSES = ("ok", "error", "bypass", "unreachable")
+# A harness that registers the same hook twice (a plugin and a project entry)
+# fires it twice for one call. The id it gives the call is looked for in this
+# much of the ledger's tail before an event carrying it is appended.
+DEDUP_TAIL_BYTES = 256 * 1024
+
+LINE_START = "start"
+LINE_EVENT = "event"
+LINE_FINISH = "finish"
+
+# Where "the execution this session has open" is remembered for callers that
+# cannot inherit an environment variable -- a harness that runs every command
+# in a fresh shell is the ordinary case, not the exception.
+STATE_ENV = "EOS_STATE_DIR"
+EXECUTION_ENV = "EOS_EXECUTION"
+LEDGER_ENV = "EOS_EXECUTION_LEDGER"
+
+
+@dataclasses.dataclass(frozen=True)
+class Event:
+    execution: str
+    ord: int | None
+    at: str
+    kind: str
+    tool: str | None = None
+    target: str | None = None
+    ref: str | None = None
+    exit_code: int | None = None
+    ms: int | None = None
+    body: str | None = None
+    session: str | None = None
+    # Which agent acted: a subagent's type, None for the session's own agent.
+    agent: str | None = None
+    source: str | None = None
+    status: str | None = None
+    # The harness's id for the tool call this event records, when it has one.
+    tool_use_id: str | None = None
+    # "e-" + 8 hex, so a decision can cite the event; "<execution>#<ord>" for a
+    # line written before events had one.
+    id: str | None = None
+    # Fingerprint of the raw output a wrapper saw (sha256 of the file's bytes) and
+    # where that file was; the content itself is never copied into the ledger.
+    output_sha256: str | None = None
+    output_path: str | None = None
+    # A decision's cited event ids, its state and the check that backs it (a
+    # decision event, tool "decide"; core/decisions.py). Written only when set.
+    evidence: list[str] | None = None
+    claim_state: str | None = None
+    check: str | None = None
+    # The refusal codes a decision had when it was written; frozen, never recomputed.
+    reasons: list[str] | None = None
+
+
+@dataclasses.dataclass
+class Record:
+    id: str
+    title: str
+    procedure: str | None = None
+    work_item: str | None = None
+    session: str | None = None
+    agent: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    outcome: str | None = None
+    target: str | None = None
+    branch: str | None = None
+    commit_start: str | None = None
+    commit_end: str | None = None
+    lesson: str | None = None
+    # For outcome "ok": "verified" when every scope the run changed passed its
+    # check after the last change, "claimed" when one did not, None when the
+    # run changed nothing a check covers (ADR-028).
+    outcome_source: str | None = None
+    events: list = dataclasses.field(default_factory=list)
+
+    @property
+    def open(self) -> bool:
+        return self.outcome is None
+
+    def to_dict(self) -> dict:
+        data = dataclasses.asdict(self)
+        data["events"] = [dataclasses.asdict(e) for e in self.events]
+        return data
+
+
+def path_for(project_root: str | Path) -> Path:
+    """Beside the notes and the work ledger, for the reason they are there:
+    `eos scan` rewrites `.eos/data`, and what a session did cannot be
+    recomputed from a file tree."""
+    return notes.notes_dir(project_root) / FILENAME
+
+
+# --- the session pointer -----------------------------------------------------------
+
+
+def _state_dir() -> Path:
+    configured = os.environ.get(STATE_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "state" / "eos"
+
+
+def _pointer(session: str) -> Path:
+    safe = "".join(ch for ch in session if ch.isalnum() or ch in "-_.")[:64] or "unnamed"
+    return _state_dir() / "current" / safe
+
+
+def session_for(project_root: str | Path, session: str | None = None) -> str | None:
+    """An explicit id wins; otherwise the harness's, read as telemetry reads it."""
+    if session:
+        return session
+    from core import telemetry
+    detected, _ = telemetry.detect_session(project_root)
+    return detected
+
+
+def current(project_root: str | Path | None = None, session: str | None = None
+            ) -> tuple[str, Path] | None:
+    """(execution id, ledger path) for whatever this caller should append to.
+
+    The environment first -- a host that can export a variable should not
+    depend on a file -- then the pointer `start` left for this session.
+    """
+    exported, ledger = os.environ.get(EXECUTION_ENV), os.environ.get(LEDGER_ENV)
+    if exported and ledger:
+        return exported, Path(ledger)
+    if exported and project_root is not None:
+        return exported, path_for(project_root)
+    sid = session_for(project_root or ".", session)
+    if not sid:
+        return None
+    try:
+        text = _pointer(sid).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    execution, _, path = text.partition("\t")
+    if not execution or not path:
+        return None
+    return execution, Path(path)
+
+
+def _earlier(pointer: Path) -> Path:
+    """The runs a session opened before its current one, oldest first, one
+    `<execution>\\t<ledger>` line each -- beside the pointer, never in it: the
+    shell helper reads the pointer's first line and nothing else."""
+    return pointer.with_name(pointer.name + ".earlier")
+
+
+def _write_pointer(session: str, execution: str, ledger: Path) -> None:
+    target = _pointer(session)
+    try:
+        from core.lib import atomic
+
+        try:
+            previous = target.read_text(encoding="utf-8").strip()
+        except OSError:
+            previous = ""
+        if previous and previous.split("\t", 1)[0] != execution:
+            # A run opened inside another one does not end the first (E1).
+            with open(_earlier(target), "a", encoding="utf-8") as handle:
+                handle.write(previous + "\n")
+        atomic.write_text(target, f"{execution}\t{ledger}\n")
+    except OSError:
+        pass  # capture falls back to explicit ids; recording itself never fails on this
+
+
+def _clear_pointer(session: str | None, execution: str) -> None:
+    """Point the session back at the latest run it opened earlier that is still
+    open, or at nothing. Removing the pointer outright left a session's first
+    run open with nothing recording into it once a second run had come and
+    gone (E1, measured on the host)."""
+    if not session:
+        return
+    target = _pointer(session)
+    try:
+        if target.read_text(encoding="utf-8").split("\t", 1)[0].strip() != execution:
+            return
+        earlier = _earlier(target)
+        try:
+            stack = [line for line in earlier.read_text(encoding="utf-8").splitlines() if "\t" in line]
+        except OSError:
+            stack = []
+        while stack:
+            previous, _, ledger = stack.pop().partition("\t")
+            if previous != execution and _open_in(Path(ledger), previous):
+                from core.lib import atomic
+
+                atomic.write_text(target, f"{previous}\t{ledger}\n")
+                atomic.write_text(earlier, "".join(line + "\n" for line in stack))
+                return
+        target.unlink()
+        earlier.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# --- writing -----------------------------------------------------------------------
+
+
+def rotated(ledger: Path, index: int) -> Path:
+    return ledger.with_name(f"{ledger.stem}.{index}{ledger.suffix}")
+
+
+def _rotate(ledger: Path) -> None:
+    oldest = rotated(ledger, KEEP_ROTATED)
+    if oldest.exists():
+        oldest.unlink()
+    for index in range(KEEP_ROTATED - 1, 0, -1):
+        if rotated(ledger, index).exists():
+            os.replace(rotated(ledger, index), rotated(ledger, index + 1))
+    os.replace(ledger, rotated(ledger, 1))
+
+
+def _append(ledger: Path, line: dict) -> None:
+    from core.lib import lock
+
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with lock.locked(ledger):
+        if ledger.is_file() and ledger.stat().st_size > MAX_LEDGER_BYTES:
+            _rotate(ledger)
+        with open(ledger, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"v": LEDGER_VERSION, **line}, ensure_ascii=False) + "\n")
+
+
+def _checked(value: str | None, what: str) -> str | None:
+    """The refusals the work ledger makes, for the same reason: this file is
+    committed and pushed like the notes are."""
+    from core import work
+    work._refuse_unusable(value, what)
+    return value
+
+
+CHECK_MAX = 120
+_CHECK_REFUSED = re.compile(r"['\"=;]|\b(?:select|insert|update|delete|where)\b|\d{5}", re.I)
+
+
+def _plain_check(check: str | None) -> None:
+    """A decision's check names the command, never the query or the value it
+    would run with: the ledger is pushed, and a customer's number (5+ digits, in
+    a WHERE clause or bare) would go with it. The value is not echoed back."""
+    if check is None:
+        return
+    if len(check) > CHECK_MAX or _CHECK_REFUSED.search(check):
+        raise ValueError(f"check must be the wrapper, subcommand and first operand only "
+                         f"(e.g. `automation/db.sh pg staging accounts`), at most {CHECK_MAX} chars; drop "
+                         f"identifiers and values: no quote, `=`, `;`, SQL verb or 5+ digit run")
+
+
+def start(project_root: str | Path, title: str, *, procedure: str | None = None,
+          work_item: str | None = None, session: str | None = None,
+          agent: str | None = None, target: str | None = None) -> Record:
+    """Open an execution and remember it as this session's current one."""
+    from core import work
+    from core.knowledge.evidence import utc_now
+
+    if not title or not title.strip():
+        raise ValueError("an execution without a title is not findable by anyone")
+    _checked(title, "title")
+    if procedure:
+        newer = notes.replacing_procedure(project_root, procedure)
+        if newer is not None:
+            raise ValueError(f"procedure {procedure!r} was replaced by {newer.procedure!r} "
+                             f"({newer.title}); start the run with --procedure {newer.procedure}")
+        stale = notes.expired_procedure(project_root, procedure)
+        if stale is not None:
+            raise ValueError(f"procedure {procedure!r} expired {stale.valid_until} "
+                             f"({stale.title}); it is refused the same way a replaced procedure is")
+    sid = session_for(project_root, session)
+    commit, branch = work.git_head(project_root)
+    record = Record(id=f"x-{work.make_id(title)}", title=title.strip(), procedure=procedure,
+                    work_item=work_item, session=sid, agent=agent, started_at=utc_now(),
+                    target=target, branch=branch, commit_start=commit)
+    ledger = path_for(project_root)
+    line = {"type": LINE_START, **{k: v for k, v in record.to_dict().items() if k != "events"}}
+    _append(ledger, line)
+    if sid:
+        _write_pointer(sid, record.id, ledger.resolve())
+    return record
+
+
+def event(project_root: str | Path, execution: str | None = None, *, kind: str,
+          tool: str | None = None, target: str | None = None, ref: str | None = None,
+          exit_code: int | None = None, ms: int | None = None, body: str | None = None,
+          session: str | None = None, agent: str | None = None, source: str | None = None,
+          status: str | None = None, tool_use_id: str | None = None,
+          ledger: Path | None = None, evidence: list[str] | None = None,
+          claim_state: str | None = None, check: str | None = None,
+          reasons: list[str] | None = None) -> Event | None:
+    """Append one thing the session did. Without an id, to this session's current execution.
+
+    `ledger` names the ledger holding `execution` when it is not
+    `project_root`'s own (a workspace run, C5b).
+
+    Returns None, writing nothing, when `tool_use_id` is already in the
+    ledger's tail: the same call reported twice is one thing the session did.
+    """
+    from core.knowledge.evidence import utc_now
+
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {', '.join(KINDS)}; got {kind!r}")
+    if source is not None and source not in SOURCES:
+        raise ValueError(f"source must be one of {', '.join(SOURCES)}; got {source!r}")
+    if status is not None and status not in STATUSES:
+        raise ValueError(f"status must be one of {', '.join(STATUSES)}; got {status!r}")
+    ledger = Path(ledger) if ledger and execution else path_for(project_root)
+    if not execution:
+        found = current(project_root, session)
+        if found is None:
+            raise ValueError("no execution given and none is open for this session; "
+                             "`eos run start` opens one")
+        execution, ledger = found
+    _checked(ref, "ref")
+    _checked(body, "body")
+    _checked(check, "check")
+    _plain_check(check)
+    if tool_use_id and recorded(ledger, tool_use_id):
+        return None
+    entry = Event(execution=execution, ord=None, at=utc_now(), kind=kind, tool=normalize_tool(tool),
+                  target=normalize_target(target), ref=ref, exit_code=exit_code, ms=ms, body=body,
+                  session=session_for(project_root, session), agent=agent or None,
+                  source=source, status=status, tool_use_id=tool_use_id or None,
+                  id=f"e-{secrets.token_hex(4)}", evidence=list(evidence) if evidence else None,
+                  claim_state=claim_state, check=check,
+                  reasons=list(reasons) if reasons else None)
+    line = {"type": LINE_EVENT, **{k: v for k, v in dataclasses.asdict(entry).items()
+                                   if v is not None or k in _BASE_EVENT_FIELDS}}
+    _append(ledger, line)
+    return entry
+
+
+# What EOS records when one of its own commands writes a note: the agent of the
+# change, as `edit`/`write`/`bash` are for the hooks' `changed` events (E1).
+MEMORY_TOOL = "eos"
+
+
+def note_written(project_root: str | Path, path: str | Path, *, action: str,
+                 session: str | None = None, found: tuple[str, Path] | None = None) -> Event | None:
+    """A note an EOS command wrote, as a `changed` event on the calling
+    session's open run; None, writing nothing, when there is no such run.
+
+    The editor hooks see only the harness's Edit/Write calls, so a note
+    `eos note add` wrote was a file the run's commits touched that no event
+    named -- most of them, measured on the host (E1). The run is found the way
+    `eos verify` and the shell helper find it (`current`, through the session
+    pointer); `found` passes it in when the caller already holds it. The ref
+    is relative to the run's own project, which in a workspace can be another
+    project than the one whose store holds the note (C5b, ADR-035): there a
+    note outside that project is named by its absolute path, as the editor
+    hook names a file outside the project. Never raises: the note is written
+    either way, and the timeline line is a convenience.
+    """
+    try:
+        found = found or current(project_root, session)
+        if found is None:
+            return None
+        execution, ledger = found
+        run_root = (_root_of(Path(ledger)) or Path(project_root)).expanduser().resolve()
+        written = Path(path).expanduser().resolve()
+        try:
+            ref = written.relative_to(run_root).as_posix()
+        except ValueError:
+            ref = str(written)
+        return event(run_root, execution, ledger=Path(ledger), kind="changed", tool=MEMORY_TOOL, ref=ref,
+                     body=action, session=session, source="cli", status="ok")
+    except (ValueError, OSError):
+        return None
+
+
+def is_memory_write(entry: Event) -> bool:
+    """A note EOS wrote (`note_written`): memory about the work, not the work --
+    no check is owed for it and no procedure scope is expected to cover it."""
+    return entry.kind == "changed" and entry.tool == MEMORY_TOOL and entry.source == "cli"
+
+
+def recorded(ledger: Path, tool_use_id: str) -> bool:
+    """Whether an event for this harness call id is already in the ledger's tail."""
+    try:
+        with open(ledger, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - DEDUP_TAIL_BYTES))
+            tail = handle.read()
+    except OSError:
+        return False
+    return f'"tool_use_id": {json.dumps(tool_use_id)}'.encode("utf-8") in tail
+
+
+def outcome_source(project_root: str | Path, record: Record | None) -> tuple[str | None, list[str]]:
+    """("verified" | "claimed" | None, the instances still unverified), from the run's events."""
+    from core import verify
+
+    if record is None:
+        return None, []
+    scopes = verify.load(project_root)
+    if not scopes:
+        return _success_source(project_root, record)
+    events = []
+    for entry in record.events:
+        if is_memory_write(entry):
+            continue
+        if entry.kind == "changed" and entry.ref:
+            events.append(("changed", entry.ref))
+        elif entry.kind == "verified" and entry.tool == "verify" and entry.ref:
+            events.append(("passed", entry.ref))
+    touched = {verify.instance(scopes, project_root, value) for kind, value in events if kind == "changed"}
+    if not touched - {None}:
+        return _success_source(project_root, record)
+    left = [key for key, _ in verify.dirty(scopes, project_root, events)]
+    return ("claimed" if left else "verified"), left
+
+
+def _success_source(project_root: str | Path, record: Record) -> tuple[str | None, list[str]]:
+    """A run that changed no scoped file, by its procedure's `## Success` checks:
+    verified when each tool they name ran with exit 0, claimed otherwise
+    (`success: <tool>` for each that did not); None without such checks."""
+    if not record.procedure:
+        return None, []
+    from core import steps
+
+    try:
+        note = notes.find_procedure(project_root, record.procedure)
+        wanted = steps.success_checks(project_root, note)
+    except (ValueError, OSError):
+        return None, []
+    if not wanted:
+        return None, []
+    # Only what ran after the run's last change, as the check it names: an early
+    # `git status` is not a later `git log` (review 12). A note EOS wrote is no
+    # change a check is owed for (E1).
+    events = [e for e in record.events if not is_memory_write(e)]
+    changes = [n for n, e in enumerate(events) if e.kind == "changed"]
+    after = events[changes[-1] + 1:] if changes else events
+    passed = {(normalize_tool(e.tool), ((e.ref or e.body or "").split() or [None])[0]) for e in after
+              if e.tool and e.exit_code in (0, None) and e.status not in ("failed", "error")}
+    left = [f"success: {tool} {verb}".rstrip() if verb else f"success: {tool}" for tool, verb in wanted
+            if not any(t == tool and (verb is None or v == verb) for t, v in passed)]
+    return ("claimed" if left else "verified"), left
+
+
+# Who may write an event that proves something: a session can type any event with
+# `eos run event` (source cli), and that is text, not a check that ran.
+_PROOF_SOURCES = ("wrapper", "hook")
+
+
+def _tool_wrote_a_pass(entry: Event) -> bool:
+    if entry.source not in _PROOF_SOURCES or entry.tool == "subagent":
+        return False
+    if entry.kind == "verified" and entry.tool == "verify":
+        return entry.status == "ok"
+    # No status is a wrapper that gave none; `unreachable` and `bypass` exit 0 and checked nothing.
+    return entry.kind in ("ran", "called", "verified") and entry.exit_code == 0 and entry.status in (None, "ok")
+
+
+def proof(project_root: str | Path, record: Record) -> list[Event]:
+    """The events behind a verified outcome, each written by a tool; [] when one of
+    them was not, or the record no longer shows them. The same two paths as
+    `outcome_source`: the last check of each scope the run changed, else the check
+    each `## Success` line names after the run's last change."""
+    from core import steps, verify
+
+    scopes = verify.load(project_root)
+    changed = [e.ref for e in record.events if e.kind == "changed" and e.ref and not is_memory_write(e)]
+    touched = {verify.instance(scopes, project_root, value) for value in changed} - {None} if scopes else set()
+    if touched:
+        last = {e.ref: e for e in record.events if e.kind == "verified" and e.tool == "verify" and e.ref}
+        found = [last.get(key) for key in sorted(touched)]
+        return found if all(e is not None and _tool_wrote_a_pass(e) for e in found) else []
+    if not record.procedure:
+        return []
+    try:
+        wanted = steps.success_checks(project_root, notes.find_procedure(project_root, record.procedure))
+    except (ValueError, OSError):
+        return []
+    events = [e for e in record.events if not is_memory_write(e)]
+    changes = [n for n, e in enumerate(events) if e.kind == "changed"]
+    after = [e for e in (events[changes[-1] + 1:] if changes else events) if _tool_wrote_a_pass(e)]
+    found = []
+    for tool, verb in wanted:
+        match = [e for e in after if normalize_tool(e.tool) == tool
+                 and (verb is None or ((e.ref or e.body or "").split() or [None])[0] == verb)]
+        if not match:
+            return []
+        found.append(match[-1])
+    return found
+
+
+def _open_in(ledger: Path, execution: str) -> bool:
+    record = next(iter(load_path(ledger, only=execution)), None)
+    return record is not None and record.outcome is None
+
+
+def _root_of(ledger: Path) -> Path | None:
+    """The project whose ledger this is, so its lessons, procedure counters and
+    git head are the ones written -- not the caller's."""
+    for candidate in Path(ledger).resolve().parents:
+        try:
+            if path_for(candidate).resolve() == Path(ledger).resolve():
+                return candidate
+        except Exception:  # noqa: BLE001 - an unrelated ancestor's broken config is not a match
+            continue
+    return None
+
+
+def root_for(project_root: str | Path, execution: str) -> Path:
+    """The project whose ledger actually holds `execution` (2.x roadmap N6).
+
+    `project_root` itself, unless a workspace routed the run to a named
+    project's ledger and `project_root` is the workspace root the caller
+    invoked from rather than that project (C5b) -- `run finish`'s own
+    ledger resolution, reused so a post-finish read (a procedure's scope,
+    its own changed-file refs) looks in the same place `finish` wrote to.
+    """
+    root = Path(project_root).expanduser().resolve()
+    if execution in {r.id for r in load(root)}:
+        return root
+    from core import workspace
+
+    ledger = workspace.ledger_holding(root, execution)
+    return (_root_of(ledger) if ledger else None) or root
+
+
+def finish(project_root: str | Path, execution: str | None = None, *, outcome: str,
+           lesson: str | None = None, session: str | None = None,
+           next_time: str | None = None) -> Record:
+    """Close an execution with the outcome the session declares.
+
+    Idempotent: finishing again with the same outcome changes nothing. A
+    different outcome for a finished execution is refused -- two outcomes for
+    one run is a contradiction the next reader could not resolve.
+    """
+    from core import work
+    from core.knowledge.evidence import utc_now
+
+    if outcome not in OUTCOMES:
+        raise ValueError(f"outcome must be one of {', '.join(OUTCOMES)}; got {outcome!r}")
+    ledger = path_for(project_root)
+    found = current(project_root, session)
+    if not execution:
+        if found is None:
+            raise ValueError("no execution given and none is open for this session")
+        execution, ledger = found
+    elif found is not None and found[0] == execution and not _open_in(ledger, execution):
+        # A run opened in another project's ledger (a service, from the workspace
+        # root) is finished where it was started -- unless the caller's own ledger
+        # holds it open: worktrees share a committed ledger, so the same id can be
+        # open in two of them, and the caller means its own (second review).
+        ledger = found[1]
+    elif not load_path(ledger, only=execution):
+        # Routed to a workspace project by `run start` and finished by id from
+        # the workspace root, in a session that holds no pointer to it (C5).
+        from core import workspace
+        ledger = workspace.ledger_holding(project_root, execution) or ledger
+    project_root = _root_of(ledger) or project_root
+    _checked(lesson, "lesson")
+    _checked(next_time, "next time")
+    existing = next(iter(load_path(ledger, only=execution)), None)
+    if existing is None:
+        # A finish line for an id nobody started made a run out of nothing (F5).
+        raise ValueError(f"{execution} was never started in {ledger}")
+    if existing.outcome is not None:
+        if existing.outcome == outcome:
+            return existing
+        raise ValueError(f"{execution} already finished as {existing.outcome!r}; "
+                         f"it cannot also be {outcome!r}")
+    has_lesson = bool(lesson and lesson.strip())
+    if outcome == "failed" and not has_lesson and not notes.lessons_for(project_root, execution=execution):
+        # ADR-024: a failure nobody learned from is paid for again by the next
+        # session. Refused before anything is written, with both ways through.
+        raise ValueError(
+            f"a failed run must leave a lesson. Finish it with --lesson \"<what went wrong and "
+            f"what to do differently>\", or record one first: eos note add . --kind lesson "
+            f"--execution {execution} --title \"…\" --body \"## What went wrong ... "
+            f"## What was learned ... ## Next time ...\"")
+    if outcome == "failed" and has_lesson:
+        # Written before the finish line: if the note cannot be written, the
+        # run stays open rather than finished with its lesson lost.
+        written = _write_lesson(project_root, existing or Record(id=execution, title=execution),
+                                lesson, next_time)
+        note_written(project_root, written, action="run finish", found=(execution, ledger),
+                     session=existing.session)
+    source, _ = outcome_source(project_root, existing) if outcome == "ok" else (None, [])
+    commit, _ = work.git_head(project_root)
+    at = utc_now()
+    line = {"type": LINE_FINISH, "id": execution, "at": at,
+            "outcome": outcome, "lesson": lesson, "commit_end": commit}
+    if source:
+        line["outcome_source"] = source
+    _append(ledger, line)
+    _clear_pointer(existing.session if existing else session_for(project_root, session), execution)
+    # The one place a procedure's observations move (ADR-023). After the
+    # ledger line, so the ledger -- which `procedure audit` recomputes from --
+    # is never behind the counters it justifies.
+    if existing is not None and existing.procedure:
+        notes.record_procedure_run(project_root, existing.procedure, outcome=outcome,
+                                   execution=execution, at=at, lesson=lesson)
+    return load_path(ledger, only=execution)[0]
+
+
+# --- reading -----------------------------------------------------------------------
+
+_RECORD_FIELDS = {f.name for f in dataclasses.fields(Record)} - {"events"}
+_EVENT_FIELDS = [f.name for f in dataclasses.fields(Event)]
+# Written on every event line, null or not, as before 1.3.0; the attribution
+# fields after them are written only when they carry something.
+_BASE_EVENT_FIELDS = ("execution", "ord", "at", "kind", "tool", "target", "ref", "exit_code",
+                      "ms", "body", "session", "id")
+
+
+def _identities(parts: list[Path]) -> tuple:
+    found = []
+    for part in parts:
+        try:
+            found.append(part.stat().st_ino)
+        except OSError:
+            found.append(None)
+    return tuple(found)
+
+
+def _read_consistently(parts: list[Path], attempts: int = 8) -> list[str]:
+    """The files' texts, read again when a rotation renamed one of them during
+    the read -- lock-free, a reader could otherwise find neither the moved file
+    nor the new one (whole-branch review)."""
+    from core.lib import lock
+
+    texts: list[str] = []
+    for attempt in range(attempts):
+        before = _identities(parts)
+        if all(identity is None for identity in before):
+            # No file at all. Either there is no ledger, or this look was torn:
+            # `.1` checked before a rotation's rename and the ledger after it,
+            # before the next append recreates it. A ledger that was ever written
+            # has a lock file; read that one under the lock (flaky-test review).
+            # Without fcntl the O_EXCL marker is deleted on release, so its
+            # absence proves nothing there: always read under the lock.
+            if lock.fcntl is not None and not lock.ever_locked(parts[-1]):
+                return []
+            break
+        texts, vanished = [], False
+        for part, identity in zip(parts, before):
+            try:
+                texts.append(part.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                vanished = vanished or identity is not None  # there a moment ago
+        if not vanished and _identities(parts) == before:
+            return texts
+        time.sleep(0.002 * (attempt + 1))
+    # Still moving: read under the writers' lock, which a rotation holds.
+    try:
+        with lock.locked(parts[-1], timeout=2.0):
+            return [p.read_text(encoding="utf-8", errors="replace") for p in parts if p.is_file()]
+    except (lock.LockTimeout, OSError):
+        return texts
+
+
+def load_path(ledger: Path, *, only: str | None = None) -> list[Record]:
+    """Every execution in one ledger, in the order it was started; with `only`,
+    that one execution alone. A line that does not hold the id, quoted, is
+    skipped before it is decoded: a hook looking up the session's run folded
+    the whole ledger on every call (22 ms a routing decision at 3,700 events)."""
+    parts = [rotated(ledger, index) for index in range(KEEP_ROTATED, 0, -1)] + [ledger]
+    if only is None:
+        cached = _load_on_cached_rotations(ledger, parts)
+        if cached is not None:
+            return list(cached.values())
+    texts = _read_consistently(parts)
+    if not texts:
+        return []
+    records: dict[str, Record] = {}
+    # The writer keeps non-ASCII as is; an older or foreign line may escape it.
+    needles = {json.dumps(only, ensure_ascii=False), json.dumps(only)} if only is not None else None
+    _fold(texts, records, needles)
+    if only is not None:
+        return [records[only]] if only in records else []
+    return list(records.values())
+
+
+def _stamps(parts: list[Path]) -> tuple:
+    found = []
+    for part in parts:
+        try:
+            info = part.stat()
+        except OSError:
+            found.append(None)
+            continue
+        found.append((info.st_ino, info.st_size, info.st_mtime_ns))
+    return tuple(found)
+
+
+def _cache_path(ledger: Path) -> Path:
+    import hashlib
+
+    name = hashlib.sha256(str(ledger.resolve()).encode("utf-8")).hexdigest()[:24]
+    return _state_dir() / "ledger-cache" / f"{name}.pickle"
+
+
+def _cache_key(ledger: Path, stamps: tuple) -> tuple:
+    # A Record or Event field added by an upgrade makes an old fold unreadable.
+    shape = tuple(f.name for f in dataclasses.fields(Record)) + tuple(f.name for f in dataclasses.fields(Event))
+    return (str(ledger.resolve()), stamps, shape)
+
+
+def _read_cache(path: Path, key: tuple) -> dict[str, Record] | None:
+    import pickle
+
+    try:
+        stored = pickle.loads(path.read_bytes())
+    except Exception:  # noqa: BLE001 - a missing or damaged cache is folded again
+        return None
+    if not isinstance(stored, dict) or stored.get("key") != key or not isinstance(stored.get("records"), dict):
+        return None
+    return stored["records"]
+
+
+def _write_cache(path: Path, key: tuple, records: dict[str, Record]) -> None:
+    import pickle
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        scratch.write_bytes(pickle.dumps({"key": key, "records": records}, protocol=pickle.HIGHEST_PROTOCOL))
+        os.replace(scratch, path)
+    except OSError:
+        pass  # a cache that cannot be written costs the next prompt a full fold, never this one
+
+
+def _load_on_cached_rotations(ledger: Path, parts: list[Path]) -> dict[str, Record] | None:
+    """The rotated files change only at a rotation, yet a brief decoded all of
+    them on every prompt (0.8 s of a 1.6 s prompt hook at 113k events). Their
+    fold is kept in the state directory -- never beside the ledger, which a
+    project may commit -- and only the live file is decoded on top of it.
+    None when nothing is rotated yet, or when a rotation kept moving the files
+    during the read: the caller's lock-aware read is the one that copes."""
+    old = parts[:-1]
+    for _ in range(3):
+        stamps = _stamps(old)
+        if all(stamp is None for stamp in stamps):
+            return None
+        key = _cache_key(ledger, stamps)
+        held = _held.get(key[0])
+        if held is not None and held[0] == key:
+            try:
+                live = ledger.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                live = None
+            if live == held[1] and _stamps(old) == stamps:
+                return _copied(held[2])
+        path = _cache_path(ledger)
+        records = _read_cache(path, key)
+        old_texts, vanished = None, False
+        if records is None:
+            old_texts = []
+            for part, stamp in zip(old, stamps):
+                try:
+                    old_texts.append(part.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    vanished = vanished or stamp is not None  # there a moment ago
+        live_before = _stamps([ledger])[0]
+        try:
+            live = ledger.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            live, vanished = "", vanished or live_before is not None
+        if vanished or _stamps(old) != stamps:
+            continue  # a rotation moved the live file into .1 during the read
+        if records is None:
+            records = {}
+            _fold(old_texts, records, None)
+            _write_cache(path, key, records)
+        _fold([live], records, None)
+        _held[key[0]] = (key, live, records)
+        return _copied(records)
+    return None
+
+
+# The last fold of each rotated ledger this process read, with the live text it
+# folded: one prompt hook loaded the same 113k-event ledger three times, ~250 ms
+# each (2026-11-05). The live file is compared by its whole text, not its stamp:
+# a rewrite within one mtime tick keeps the size and the stamp.
+_held: dict[str, tuple[tuple, str, dict[str, Record]]] = {}
+
+
+def _copied(records: dict[str, Record]) -> dict[str, Record]:
+    """Records a caller may change without changing the next load: the events are
+    frozen and shared, the records and their event lists are new."""
+    copies = {}
+    for execution, record in records.items():
+        copy = dataclasses.replace(record, events=list(record.events))
+        copies[execution] = copy
+    return copies
+
+
+def _fold(texts: list[str], records: dict[str, Record], needles: set[str] | None) -> None:
+    """Fold the ledger lines in `texts` into `records`, in order."""
+    text = "".join(t if t.endswith("\n") else t + "\n" for t in texts if t)
+
+    def get(execution: str) -> Record:
+        record = records.get(execution)
+        if record is None:
+            record = Record(id=execution, title=execution)
+            records[execution] = record
+        return record
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or (needles is not None and not any(needle in line for needle in needles)):
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        kind = data.get("type")
+        if kind == LINE_START and data.get("id"):
+            record = get(data["id"])
+            for name in _RECORD_FIELDS:
+                if data.get(name) is not None:
+                    setattr(record, name, data[name])
+        elif kind == LINE_EVENT and data.get("execution") and data.get("kind"):
+            record = get(data["execution"])
+            values = {name: data.get(name) for name in _EVENT_FIELDS}
+            values["ord"] = len(record.events)
+            values["id"] = values["id"] or f"{record.id}#{values['ord']}"
+            # An event appended without a session id belongs to the session
+            # that opened the run: a wrapper called from a context with no
+            # harness variable did not stop being part of it.
+            if not values.get("session"):
+                values["session"] = record.session
+            values["tool"] = normalize_tool(values.get("tool"))
+            values["target"] = normalize_target(values.get("target"))
+            try:
+                record.events.append(Event(**values))
+            except TypeError:
+                continue
+            if record.started_at is None:
+                record.started_at = values["at"]
+        elif kind == LINE_FINISH and data.get("id"):
+            record = get(data["id"])
+            if record.outcome is None:
+                record.outcome = data.get("outcome")
+                record.finished_at = data.get("at")
+                record.lesson = data.get("lesson")
+                record.commit_end = data.get("commit_end")
+                record.outcome_source = data.get("outcome_source")
+
+
+def load(project_root: str | Path) -> list[Record]:
+    return load_path(path_for(project_root))
+
+
+def fold_events_for_display(events: list[Event]) -> list[tuple[Event, int, str, str]]:
+    """Consecutive events identical in everything `run show` prints except the
+    ordinal and the timestamp, folded into one display group (2.x roadmap N4):
+    ``(the first event, how many, its 'at', the last one's 'at')``.
+
+    Reads the loaded events only -- the ledger file stays append-only (ADR-020)
+    and JSON output (`--format json`) still lists every event.
+    """
+    def key(event: Event) -> tuple:
+        return (event.kind, event.tool, event.target, event.ref, event.exit_code,
+                event.ms, event.status, event.agent)
+
+    groups: list[tuple[Event, int, str, str]] = []
+    for event in events:
+        if groups and key(groups[-1][0]) == key(event):
+            first, count, first_at, _ = groups[-1]
+            groups[-1] = (first, count + 1, first_at, event.at)
+        else:
+            groups.append((event, 1, event.at, event.at))
+    return groups
+
+
+def by_session(project_root: str | Path, session: str) -> list[Record]:
+    """Executions this session started or acted in."""
+    return [r for r in load(project_root)
+            if r.session == session or any(e.session == session for e in r.events)]
+
+
+def resolve(records: list[Record], needle: str) -> Record:
+    """By exact id, then by id prefix, then by title words -- one match or an error."""
+    exact = [r for r in records if r.id == needle]
+    if exact:
+        return exact[0]
+    matches = [r for r in records if r.id.startswith(needle)] or \
+              [r for r in records if needle.casefold() in r.title.casefold()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"no execution matches {needle!r}")
+    raise ValueError(f"{len(matches)} executions match {needle!r}: "
+                     + ", ".join(r.id for r in matches[:5]))
+
+
+# --- procedures, from the ledger's side (ADR-023) ---------------------------------
+
+NOT_VERIFIED_AFTER_DAYS = 30
+
+
+def of_procedure(project_root: str | Path, slug: str) -> list[Record]:
+    return [r for r in load(project_root) if r.procedure == slug]
+
+
+def audit_procedures(project_root: str | Path, now: str | None = None) -> list[dict]:
+    """What `eos procedure audit` reports, one dict per procedure.
+
+    Counters are recomputed from the ledger, which is the source of truth
+    they summarise; a disagreement is a hand edit or a lost write, and is
+    reported rather than repaired -- which side is right is not knowable here.
+    """
+    import datetime
+
+    from core.knowledge.evidence import utc_now
+
+    clock = datetime.datetime.fromisoformat(now or utc_now())
+    stale_names = {entry["note"] for entry in notes.stale_notes(project_root)}
+    report = []
+    # The audit's job is to surface a problem, and an expired procedure never
+    # run (or failing) is exactly that -- it must not disappear here (N8).
+    for note in notes.procedures(project_root, include_expired=True):
+        runs = of_procedure(project_root, note.procedure or "")
+        ok = sum(1 for r in runs if r.outcome == "ok")
+        failed = sum(1 for r in runs if r.outcome == "failed")
+        verified = max((r.finished_at for r in runs if r.outcome == "ok" and r.finished_at), default=None)
+        finished = [r for r in runs if r.outcome]
+        problems = []
+        if (note.runs_ok or 0, note.runs_failed or 0) != (ok, failed):
+            problems.append(f"counters say {note.runs_ok or 0} ok / {note.runs_failed or 0} failed, "
+                            f"the ledger says {ok} / {failed}")
+        if finished and finished[-1].outcome == "failed":
+            problems.append(f"the latest run failed ({finished[-1].id})")
+        if verified is None:
+            problems.append("never verified by a finished run")
+        else:
+            age = (clock - datetime.datetime.fromisoformat(verified)).days
+            if age > NOT_VERIFIED_AFTER_DAYS:
+                problems.append(f"last verified {age} days ago")
+        if note.path.name in stale_names:
+            problems.append("a file it is scoped to changed since it was written")
+        report.append({"procedure": note.procedure, "title": note.title, "path": str(note.path),
+                       "runs_ok": ok, "runs_failed": failed, "last_verified": verified,
+                       "problems": problems,
+                       "mismatch": any(p.startswith("counters say") for p in problems)})
+    return report
+
+
+# --- retrieval (M3) --------------------------------------------------------------
+
+
+def _ubiquitous(records: list[Record]) -> set[str]:
+    """Words in more than half of the records' titles, targets and procedures.
+
+    Nine of ten runs here were titled "Run the <x> scenario on staging", so a
+    prompt containing "run" -- most prompts -- matched every one of them and
+    the brief listed scenario runs under a task about nothing of the kind. A
+    word that describes most of the ledger describes none of it.
+    """
+    if len(records) < 2:
+        return set()
+    counts: dict[str, int] = {}
+    for record in records:
+        text = " ".join(part for part in (record.title, record.target, record.procedure) if part)
+        for word in notes._words(text):
+            counts[word] = counts.get(word, 0) + 1
+    return {word for word, n in counts.items() if n * 2 > len(records)}
+
+
+def _task_overlap(record: Record, task_words: set[str]) -> int:
+    text = " ".join(part for part in (record.title, record.target, record.procedure) if part)
+    return len(notes._words(text) & task_words)
+
+
+def ranked(project_root: str | Path, *, procedure: str | None = None, target: str | None = None,
+           task: str | None = None, limit: int = 3, records: list[Record] | None = None
+           ) -> list[Record]:
+    """The executions a session about to do this should read, best first.
+
+    Recency decides the order, because the last run is the one most likely to
+    still describe the system. The ledger's own line order breaks ties: runs
+    finished inside one second share a timestamp, and the later line is the
+    later run. Which runs are candidates is decided before that:
+
+      procedure given   runs of that procedure only
+      else task given   runs whose title/target/procedure share a word with it
+      else              every run
+
+    and, when a target is given, runs against it lead -- a staging run says
+    more about the next staging run than a production one does.
+
+    A failed run with a lesson is not promoted above newer runs here; the
+    brief shows it separately when it falls outside the top N, so the order
+    stays "most recent first" and nothing a session needs is cut.
+    """
+    found = records if records is not None else load(project_root)
+    ordered = list(reversed(found))  # ledger order, newest first
+    if procedure:
+        ordered = [r for r in ordered if r.procedure == procedure]
+    elif task:
+        words = notes._words(task) - _ubiquitous(found)
+        scored = [(r, _task_overlap(r, words)) for r in ordered]
+        ordered = [r for r, overlap in sorted(scored, key=lambda pair: -pair[1]) if overlap > 0]
+    if target:
+        ordered = sorted(ordered, key=lambda r: r.target != target)
+    return ordered[:limit] if limit else ordered
+
+
+def last_lesson(records: list[Record]) -> Record | None:
+    """The most recent failed run that left a lesson, among `records`."""
+    for record in reversed(records):
+        if record.outcome == "failed" and record.lesson:
+            return record
+    return None
+
+
+# --- lessons (ADR-024) ------------------------------------------------------------
+
+SEEN_AGAIN = "Seen again"
+
+
+def _write_lesson(project_root: str | Path, record: Record, lesson: str, next_time: str | None) -> Path:
+    """The lesson note a failed run leaves behind, or one more sighting of it."""
+    first = " ".join(lesson.strip().splitlines()[0].split())
+    title = first if len(first) <= 100 else first[:99] + "…"
+    broke = [e for e in record.events if isinstance(e.exit_code, int) and e.exit_code != 0]
+    went_wrong = [f"The run \"{record.title}\"" + (f" against {record.target}" if record.target else "")
+                  + f" ({record.id}) failed."]
+    for e in broke[:5]:
+        went_wrong.append(f"- {e.tool or e.kind} exited {e.exit_code}" + (f" ({e.ref})" if e.ref else ""))
+    body = "\n".join([
+        "## What went wrong", "", *went_wrong, "",
+        "## What was learned", "", lesson.strip(), "",
+        "## Next time", "",
+        (next_time or "").strip() or f"Read this before running "
+        f"{record.procedure or record.title} again.",
+    ])
+    try:
+        return notes.add_note(project_root, kind="lesson", title=title, body=body, tags=["lesson"],
+                              session=record.session, procedure=record.procedure,
+                              execution=record.id)
+    except notes.SimilarNoteError:
+        # A lesson worded close to an older one: a failed run must still close,
+        # and `run finish` has no --differs to offer; the run is what differs.
+        return notes.add_note(project_root, kind="lesson", title=title, body=body, tags=["lesson"],
+                              session=record.session, procedure=record.procedure,
+                              execution=record.id, differs=f"lesson of run {record.id}")
+    except notes.DuplicateNoteError:
+        # The same lesson again is a recurring failure, and should read as one.
+        key = notes.normalized_title_key(title)
+        for note in notes.lessons_for(project_root):
+            if notes.normalized_title_key(note.title) == key:
+                notes.append_to_note_section(note.path, SEEN_AGAIN,
+                                             f"{(record.started_at or '')[:10]} {record.id}")
+                return note.path
+        # A different note already holds this title; keep the lesson, under the run's name.
+        return notes.add_note(project_root, kind="lesson", title=f"{title} ({record.id})", body=body,
+                              tags=["lesson"], session=record.session, procedure=record.procedure,
+                              execution=record.id, differs=f"lesson of run {record.id}")
+
+
+# --- tool and change memory (M5) ----------------------------------------------------
+
+_TOOL_SUFFIXES = (".sh", ".py", ".js", ".ts", ".exe", ".cmd", ".bat")
+
+
+def normalize_tool(name: str | None) -> str | None:
+    """`automation/jenkins.sh`, `./Jenkins.sh` and `jenkins` are one tool.
+
+    The wrapper or program name, lower-cased, without a path or a script
+    suffix -- so "which tools ran" counts a tool once however a wrapper
+    happened to spell its own name.
+    """
+    if not name or not str(name).strip():
+        return None
+    base = str(name).strip().replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    for suffix in _TOOL_SUFFIXES:
+        if base.endswith(suffix) and len(base) > len(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base or None
+
+
+def normalize_target(name: str | None) -> str | None:
+    return str(name).strip().lower() or None if name else None
+
+
+@dataclasses.dataclass
+class ToolUse:
+    tool: str
+    count: int = 0
+    failures: int = 0
+    runs: int = 0
+    last_outcome: str | None = None
+    last_at: str | None = None
+    targets: list = dataclasses.field(default_factory=list)
+
+
+def tools(project_root: str | Path, *, procedure: str | None = None,
+          target: str | None = None, records: list[Record] | None = None) -> list[ToolUse]:
+    """Which tools ran, how often, how often they exited non-zero, and the
+    outcome of the most recent run each was part of -- most used first. A
+    note EOS wrote (`is_memory_write`) is no tool the run used."""
+    found = records if records is not None else load(project_root)
+    wanted = normalize_target(target)
+    usage: dict[str, ToolUse] = {}
+    for record in found:  # ledger order, so "last" is the latest run
+        if procedure and record.procedure != procedure:
+            continue
+        seen_here: set[str] = set()
+        for e in record.events:
+            tool = normalize_tool(e.tool)
+            event_target = normalize_target(e.target) or normalize_target(record.target)
+            if not tool or is_memory_write(e) or (wanted and event_target != wanted):
+                continue
+            use = usage.setdefault(tool, ToolUse(tool=tool))
+            use.count += 1
+            if isinstance(e.exit_code, int) and e.exit_code != 0:
+                use.failures += 1
+            if event_target and event_target not in use.targets:
+                use.targets.append(event_target)
+            if tool not in seen_here:
+                use.runs += 1
+                seen_here.add(tool)
+            use.last_outcome = record.outcome
+            use.last_at = e.at
+    return sorted(usage.values(), key=lambda u: (-u.count, u.tool))
+
+
+def diff(project_root: str | Path, execution: str) -> dict:
+    """What an execution changed: the paths its `changed` events name, and the
+    commit range it ran across with the commits and files inside it.
+
+    References only (ADR-022): paths and commit ids, resolved through git for
+    as long as the repository holds them. No content is stored or printed.
+    """
+    import shutil
+    import subprocess
+
+    record = resolve(load(project_root), execution)
+    paths: list[str] = []
+    for e in record.events:
+        if e.kind == "changed" and e.ref and e.ref not in paths:
+            paths.append(e.ref)
+    out = {"execution": record.id, "paths": paths, "commit_start": record.commit_start,
+           "commit_end": record.commit_end, "commits": [], "committed_paths": []}
+    git = shutil.which("git")
+    if git and record.commit_start and record.commit_end and record.commit_start != record.commit_end:
+        span = f"{record.commit_start}..{record.commit_end}"
+        try:
+            log = subprocess.run([git, "-C", str(project_root), "log", "--format=%H%x09%s", span],
+                                 capture_output=True, text=True, timeout=30)
+            files = subprocess.run([git, "-C", str(project_root), "diff", "--name-only", span],
+                                   capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return out
+        if log.returncode == 0:
+            out["commits"] = [line.split("\t", 1) for line in log.stdout.splitlines() if "\t" in line]
+        if files.returncode == 0:
+            out["committed_paths"] = [line for line in files.stdout.splitlines() if line.strip()]
+    return out

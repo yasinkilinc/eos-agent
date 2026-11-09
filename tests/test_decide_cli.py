@@ -1,0 +1,249 @@
+"""`eos decide`: record a decision with its evidence, resolve it, list the open ones."""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from core import executions
+
+REPO = Path(__file__).resolve().parents[1]
+EOS = [sys.executable, str(REPO / "core" / "eos.py")]
+
+
+@pytest.fixture
+def project(tmp_path):
+    root = tmp_path / "proj"
+    (root / ".eos").mkdir(parents=True)
+    return root
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("EOS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("EOS_EXECUTION", raising=False)
+    monkeypatch.delenv("EOS_EXECUTION_LEDGER", raising=False)
+    e = os.environ.copy()
+    e["EOS_STATE_DIR"] = str(tmp_path / "state")
+    e.pop("EOS_EXECUTION", None)
+    e.pop("EOS_EXECUTION_LEDGER", None)
+    return e
+
+
+def _run(args, env):
+    return subprocess.run(EOS + args, capture_output=True, text=True, encoding="utf-8", env=env)
+
+
+def _start(project, env, work=None):
+    args = ["run", "start", str(project), "--title", "t", "--session", "s1"]
+    if work:
+        args += ["--work", work]
+    out = _run(args, env)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.splitlines()[0]
+
+
+def _tool_event(project, env, execution):
+    # a wrapper-recorded event is the evidence a decision may cite
+    entry = executions.event(project, execution, kind="ran", tool="build", session="s1",
+                             source="wrapper")
+    return entry.id
+
+
+def test_decide_without_evidence_is_an_assumption(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "the cache is cold", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.splitlines()
+    assert re.fullmatch(r"decision=d-[0-9a-f]{8} state=assumption", lines[0])
+    assert "reason=no-evidence evidence=-" in lines[1:]
+
+
+def test_decide_with_evidence_is_evidenced(project, env):
+    execution = _start(project, env)
+    cited = _tool_event(project, env, execution)
+    out = _run(["decide", str(project), "--claim", "build passes", "--evidence", cited,
+                "--check", "run build", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    assert re.fullmatch(r"decision=d-[0-9a-f]{8} state=evidenced\n", out.stdout)
+
+
+def test_open_lists_assumptions_with_check(project, env):
+    _start(project, env)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--check", "db.sh pg x",
+                 "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    plain = _run(["decide", str(project), "--claim", "other thing", "--session", "s1"], env)
+    out = _run(["decide", str(project), "--open", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    assert f"{did} pool is sized check=db.sh pg x" in out.stdout.splitlines()
+    assert any(line.endswith("other thing check=-") for line in out.stdout.splitlines())
+    assert plain.returncode == 0
+
+
+def test_resolve_with_evidence_exits_0(project, env):
+    execution = _start(project, env)
+    cited = _tool_event(project, env, execution)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    out = _run(["decide", str(project), "--resolve", did, "--evidence", cited,
+                "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == f"decision={did} state=resolved\n"
+
+
+def test_resolve_without_evidence_exits_3(project, env):
+    _start(project, env)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    out = _run(["decide", str(project), "--resolve", did, "--evidence", "e-00000000",
+                "--session", "s1"], env)
+    assert out.returncode == 3
+    assert out.stdout.splitlines()[0] == f"decision={did} state=assumption"
+    assert "reason=unknown-id evidence=e-00000000" in out.stdout.splitlines()
+
+
+def test_malformed_evidence_exits_2_with_nothing_on_stdout(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "x is y", "--evidence", "bogus",
+                "--session", "s1"], env)
+    assert out.returncode == 2
+    assert out.stdout == ""
+    assert "evidence" in out.stderr
+
+
+@pytest.mark.parametrize("extra", [["--claim", "a b"], ["--open"], ["--resolve", "d-00000000"]])
+def test_no_open_run_exits_2_with_the_hint(project, env, extra):
+    out = _run(["decide", str(project), "--session", "none", *extra], env)
+    assert out.returncode == 2
+    assert out.stdout == ""
+    assert "`eos run start` opens one" in out.stderr
+
+
+def test_no_approve_flag(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "x is y", "--approve", "d-00000000", "--session", "s1"], env)
+    assert out.returncode == 2
+    assert "unrecognized arguments: --approve" in out.stderr
+
+
+def test_refusal_names_the_refused_id_and_not_the_good_one(project, env):
+    execution = _start(project, env)
+    good = _tool_event(project, env, execution)
+    out = _run(["decide", str(project), "--claim", "build passes", "--evidence", good,
+                "--evidence", "e-00000000", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines()[1:] == ["reason=unknown-id evidence=e-00000000"]
+
+
+def test_hedged_claim_without_evidence_prints_bare_reasons(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "it is probably fine", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines()[1:] == ["reason=hedged evidence=-",
+                                           "reason=no-evidence evidence=-"]
+
+
+def test_open_ignores_an_assumption_from_a_different_run(project, env):
+    _start(project, env)
+    _run(["decide", str(project), "--claim", "old run thing", "--session", "s1"], env)
+    out = _run(["run", "finish", str(project), "--outcome", "ok", "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+    _start(project, env)
+    listed = _run(["decide", str(project), "--open", "--session", "s1"], env)
+    assert listed.returncode == 0, listed.stderr
+    assert "old run thing" not in listed.stdout
+
+
+def test_resolve_without_evidence_exits_3_with_no_evidence(project, env):
+    _start(project, env)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    out = _run(["decide", str(project), "--resolve", did, "--session", "s1"], env)
+    assert out.returncode == 3
+    assert out.stdout.splitlines() == [f"decision={did} state=assumption",
+                                       "reason=no-evidence evidence=-"]
+
+
+def test_a_check_holding_sql_exits_2(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "the row exists", "--check",
+                "db.sh pg staging accounts \"select * from cust where phone='15550104477'\"",
+                "--session", "s1"], env)
+    assert out.returncode == 2
+    assert out.stdout == ""
+    assert out.stderr.startswith("error: ") and "automation/db.sh pg staging accounts" in out.stderr
+    assert "15550104477" not in out.stderr
+
+
+def test_an_empty_claim_exits_2(project, env):
+    _start(project, env)
+    out = _run(["decide", str(project), "--claim", "  ", "--session", "s1"], env)
+    assert out.returncode == 2
+    assert out.stdout == "" and out.stderr.startswith("error: ")
+
+
+def test_decide_agent_flag_fills_the_decision_agent(project, env):
+    execution = _start(project, env)
+    out = _run(["decide", str(project), "--claim", "a thing", "--agent", "devin",
+                "--session", "s1"], env)
+    assert out.returncode == 0, out.stderr
+
+    from core import decisions
+    found = decisions.for_scope(project, work_item=None, execution=execution)
+    assert [d.agent for d in found] == ["devin"]
+
+
+def test_resolve_finds_an_open_assumption_in_a_closed_run(project, env):
+    closed = _start(project, env)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    assert _run(["run", "finish", str(project), closed, "--outcome", "abandoned"], env).returncode == 0
+    now = _start(project, env)
+    cited = _tool_event(project, env, now)
+
+    out = _run(["decide", str(project), "--resolve", did, "--evidence", cited, "--session", "s1"], env)
+
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == f"decision={did} state=resolved\n"
+    from core import decisions
+    assert [d.state for d in decisions.for_scope(project, work_item=None, execution=closed)] == ["resolved"]
+    assert decisions.open_assumptions(project, work_item=None, execution=closed) == []
+
+
+def test_resolve_finds_an_open_assumption_of_another_work_item(project, env):
+    from core import decisions, work
+
+    first, second = work.open_item(project, "First").id, work.open_item(project, "Second").id
+    closed = _start(project, env, first)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+    assert _run(["run", "finish", str(project), closed, "--outcome", "ok"], env).returncode == 0
+    now = _start(project, env, second)
+    cited = _tool_event(project, env, now)
+
+    out = _run(["decide", str(project), "--resolve", did, "--evidence", cited, "--session", "s1"], env)
+
+    assert out.returncode == 0, out.stderr
+    assert [d.state for d in decisions.for_scope(project, work_item=first, execution=None)] == ["resolved"]
+
+
+def test_resolve_of_an_id_nobody_recorded_says_so(project, env):
+    _start(project, env)
+
+    out = _run(["decide", str(project), "--resolve", "d-00000000", "--evidence", "e-00000000", "--session", "s1"], env)
+
+    assert out.returncode == 2 and "no decision d-00000000 in this project" in out.stderr
+
+
+def test_resolve_of_a_closed_decision_says_so(project, env):
+    execution = _start(project, env)
+    cited = _tool_event(project, env, execution)
+    made = _run(["decide", str(project), "--claim", "pool is sized", "--evidence", cited, "--session", "s1"], env)
+    did = made.stdout.split()[0].split("=")[1]
+
+    out = _run(["decide", str(project), "--resolve", did, "--evidence", cited, "--session", "s1"], env)
+
+    assert out.returncode == 2 and "not an open assumption" in out.stderr

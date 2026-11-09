@@ -1,0 +1,342 @@
+"""Decisions and assumptions: a claim is worth acting on only with evidence.
+
+A decision is one `decided` event (tool "decide", ref = the decision id) in the
+execution ledger; a state change is another event with the same ref, and the
+latest one in time wins. Evidence is a list of ledger event ids. An id counts
+only when a tool recorded the event, it did not fail, it is not a subagent's own
+report or an EOS note read, it is not stale, and it belongs to this work item. Anything else leaves the
+decision an "assumption", with every refusal code that applied.
+"""
+from __future__ import annotations
+
+import datetime
+import re
+import secrets
+from dataclasses import dataclass
+from pathlib import Path
+
+from core import executions
+
+STATES = ("evidenced", "assumption", "resolved", "approved")
+# Tools whose output is the state of a live system, so it goes stale after
+# LIVE_MAX_AGE; `[decisions] live_tools` in .eos/config.toml replaces this set.
+DEFAULT_LIVE_TOOLS = frozenset({"db", "argo", "grafana", "kafka", "jenkins", "s3"})
+LIVE_MAX_AGE = datetime.timedelta(hours=24)
+
+TOOL = "decide"
+_ACCEPTED_KINDS = ("ran", "called", "read", "verified")
+_ACCEPTED_SOURCES = ("wrapper", "hook")
+# The sources `record`, `resolve` and `approve` write a decided event with.
+_DECISION_SOURCES = ("cli", "hook")
+_NOTE_REF = "note:"
+_HEDGES = re.compile(r"\b(muhtemel\w*|olmali\w*|saniyor\w*|sanirim|galiba|herhalde|belki|"
+                     r"olabilir\w*|tahmin\w*|sanki|gibi\s+gorunuyor\w*|probably|likely|should|"
+                     r"seem|seems|seemed|assume|assumed|assumes|assuming|presumably|might|maybe|"
+                     r"perhaps|apparently|i\s+think)\b")
+_EVIDENCE_ID = re.compile(r"^(e-[0-9a-f]{8}|x-[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{4}#[0-9]+)$")
+_FOLD = str.maketrans("ışğüöç", "isguoc")
+
+
+@dataclass(frozen=True)
+class Decision:
+    id: str
+    execution: str
+    work_item: str | None
+    at: str
+    claim: str
+    evidence: tuple[str, ...]
+    state: str
+    check: str | None
+    reasons: tuple[str, ...]
+    agent: str | None
+
+
+def reason_parts(reason: str) -> tuple[str, str]:
+    """A stored reason as (code, evidence id or "-")."""
+    code, _, cited = reason.partition(" ")
+    return code, cited or "-"
+
+
+def reason_line(reason: str) -> str:
+    code, cited = reason_parts(reason)
+    return f"reason={code} evidence={cited}"
+
+
+def _hedged(claim: str) -> bool:
+    folded = claim.replace("İ", "i").replace("I", "ı").lower().translate(_FOLD)
+    return _HEDGES.search(folded) is not None
+
+
+def _parse(stamp: str) -> datetime.datetime:
+    parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def _when(at: str | None) -> datetime.datetime:
+    try:
+        return _parse(at or "")
+    except ValueError:
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def live_tools(project_root: str | Path) -> frozenset[str]:
+    """`[decisions] live_tools` of the project, else of its workspace, else the default."""
+    from core import workspace
+
+    return frozenset(workspace.strings(project_root, "decisions", "live_tools",
+                                       tuple(DEFAULT_LIVE_TOOLS)))
+
+
+def _refusal(entry: executions.Event, owner: executions.Record, run: executions.Record,
+             now: datetime.datetime, live: frozenset[str]) -> str | None:
+    if run.work_item:
+        if owner.work_item != run.work_item:
+            return "other-work-item"
+    elif owner.id != run.id:
+        return "other-work-item"
+    if entry.kind == "verified" and entry.tool == "subagent":
+        return "subagent-report"
+    if (entry.ref or "").startswith(_NOTE_REF):
+        return "note-not-evidence"
+    if entry.source is None:
+        return "no-source"
+    if entry.kind not in _ACCEPTED_KINDS or entry.source not in _ACCEPTED_SOURCES:
+        return "not-recorded-by-a-tool"
+    if entry.kind == "called" and entry.exit_code:
+        return "failed-call"
+    if entry.tool in live and now - _when(entry.at) > LIVE_MAX_AGE:
+        return "stale"
+    return None
+
+
+def _well_formed(evidence: list[str]) -> None:
+    for cited in evidence:
+        executions._checked(cited, "evidence")
+        if not _EVIDENCE_ID.match(cited):
+            raise ValueError(f"evidence must be event ids (e-xxxxxxxx or <execution>#<n>); "
+                             f"got {cited!r}")
+
+
+def project_roots(project_root: str | Path) -> list[Path]:
+    """The project and the projects of the workspace it is, or stands in."""
+    from core import workspace
+
+    root = Path(project_root).expanduser().resolve()
+    found = [root]
+    for candidate in (root, workspace.of(root)):
+        if candidate is None:
+            continue
+        found.extend(p.root for p in workspace.load_quiet(candidate))
+    return found
+
+
+def _ledgers(project_root: str | Path, session: str | None = None) -> list[Path]:
+    """Every ledger this project knows, each with its rotated parts read by
+    `load_path`: the session's run ledger, the project's own, and the ledgers of
+    the projects of the workspace the project is, or stands in
+    (`workspace.ledger_holding` resolves a workspace run the same way)."""
+    found = executions.current(project_root, session)
+    paths = [found[1]] if found else []
+    paths.append(executions.path_for(project_root))
+    paths.extend(executions.path_for(p) for p in project_roots(project_root)[1:])
+    unique: dict[Path, Path] = {}
+    for path in paths:
+        unique.setdefault(path.expanduser().resolve(), path)
+    return list(unique.values())
+
+
+def all_records(project_root: str | Path, session: str | None = None
+                ) -> list[executions.Record]:
+    """Every run in every ledger decisions reads. One call reads them all; a
+    caller that needs them more than once keeps the list."""
+    return [r for ledger in _ledgers(project_root, session) for r in executions.load_path(ledger)]
+
+
+def event_index(records: list[executions.Record]
+                ) -> dict[str, tuple[executions.Record, executions.Event]]:
+    """{event id: (its run, the event)} over these records."""
+    return {e.id: (r, e) for r in records for e in r.events}
+
+
+def _reasons(records: list[executions.Record], run: executions.Record, evidence: list[str],
+             now: str | None, *, index: dict | None = None,
+             live: frozenset[str] = DEFAULT_LIVE_TOOLS) -> list[str]:
+    """The refusal codes of `evidence` as of `now`; `index` is `event_index(records)`
+    when the caller already built it, `live` the project's `live_tools`."""
+    clock = _parse(now) if now else datetime.datetime.now(datetime.timezone.utc)
+    if index is None:
+        index = event_index(records)
+    found: list[str] = []
+    for cited in evidence:
+        hit = index.get(cited)
+        reason = "unknown-id" if hit is None else _refusal(hit[1], hit[0], run, clock, live)
+        entry = f"{reason} {cited}" if reason else None
+        if entry and entry not in found:
+            found.append(entry)
+    return found
+
+
+def _open_run(project_root: str | Path, session: str | None,
+              records: list[executions.Record] | None = None
+              ) -> tuple[executions.Record, Path, list[executions.Record]]:
+    found = executions.current(project_root, session)
+    if found is None:
+        raise ValueError("no execution is open for this session; `eos run start` opens one")
+    execution, ledger = found
+    if records is None:
+        records = all_records(project_root, session)
+    run = next((r for r in records if r.id == execution), None)
+    if run is None:
+        raise ValueError(f"execution {execution} is not in {ledger}")
+    return run, ledger, records
+
+
+def _in_scope(record: executions.Record, work_item: str | None, execution: str | None) -> bool:
+    if work_item:
+        return record.work_item == work_item
+    return execution is not None and record.id == execution
+
+
+def _fold(records: list[executions.Record], work_item: str | None, execution: str | None,
+          *, every: bool = False) -> list[Decision]:
+    """The latest state of each decision in scope (`every`: of the project), latest by `at` across every
+    ledger. `at` has whole seconds, so within one second a `resolved` or
+    `approved` event sorts after the `evidenced`/`assumption` it can only follow;
+    other ties keep read order. Only an event `record`, `resolve` or `approve`
+    could have written counts: a known `claim_state` (which `eos-event` and
+    `eos run event` cannot set) from source cli or hook, `approved` from the hook."""
+    decided: list[tuple[executions.Record, executions.Event]] = []
+    seen: set[str] = set()
+    for record in records:
+        if not every and not _in_scope(record, work_item, execution):
+            continue
+        for entry in record.events:
+            if entry.kind != "decided" or entry.tool != TOOL or not entry.ref:
+                continue
+            if entry.id in seen:
+                continue
+            seen.add(entry.id)
+            if entry.claim_state not in STATES or entry.source not in _DECISION_SOURCES:
+                continue
+            if entry.claim_state == "approved" and entry.source != "hook":
+                continue
+            decided.append((record, entry))
+    latest: dict[str, Decision] = {}
+    closing = ("resolved", "approved")
+    for record, entry in sorted(decided, key=lambda pair: (_when(pair[1].at),
+                                                           pair[1].claim_state in closing)):
+        latest[entry.ref] = Decision(
+            id=entry.ref, execution=record.id, work_item=record.work_item, at=entry.at,
+            claim=entry.body or "", evidence=tuple(entry.evidence or ()),
+            state=entry.claim_state, check=entry.check, reasons=tuple(entry.reasons or ()),
+            agent=entry.agent)
+    return list(latest.values())
+
+
+def _write(project_root: str | Path, run: executions.Record, ledger: Path, decision_id: str,
+           claim: str, evidence: list[str], state: str, check: str | None, *,
+           session: str | None, agent: str | None, source: str, reasons: list[str]
+           ) -> Decision:
+    entry = executions.event(project_root, run.id, ledger=ledger, kind="decided", tool=TOOL,
+                             ref=decision_id, body=claim, evidence=evidence, claim_state=state,
+                             check=check, reasons=reasons, session=session, agent=agent,
+                             source=source)
+    return Decision(id=decision_id, execution=run.id, work_item=run.work_item, at=entry.at,
+                    claim=claim, evidence=tuple(evidence), state=state, check=check,
+                    reasons=tuple(reasons), agent=agent)
+
+
+def record(project_root: str | Path, claim: str, evidence: list[str], *,
+           check: str | None = None, session: str | None = None, agent: str | None = None,
+           now: str | None = None) -> Decision:
+    if not claim or not claim.strip():
+        raise ValueError("a decision needs a claim: one sentence saying what was decided")
+    run, ledger, records = _open_run(project_root, session)
+    executions._checked(claim, "claim")
+    _well_formed(evidence)
+    agent = agent or run.agent
+    reasons = _reasons(records, run, evidence, now, live=live_tools(project_root))
+    if _hedged(claim):
+        reasons.append("hedged")
+    if not evidence:
+        reasons.append("no-evidence")
+    return _write(project_root, run, ledger, f"d-{secrets.token_hex(4)}", claim, list(evidence),
+                  "assumption" if reasons else "evidenced", check, session=session, agent=agent,
+                  source="cli", reasons=reasons)
+
+
+def _existing(records: list[executions.Record], decision_id: str) -> Decision:
+    found = [d for d in _fold(records, None, None, every=True) if d.id == decision_id]
+    if not found:
+        raise ValueError(f"no decision {decision_id} in this project")
+    if found[0].state != "assumption":
+        raise ValueError(f"decision {decision_id} is {found[0].state}, not an open assumption")
+    return found[0]
+
+
+def _owner(project_root: str | Path, session: str | None, records: list[executions.Record],
+           before: Decision) -> tuple[executions.Record, Path]:
+    """The run a decision belongs to and its ledger: its state change is written there,
+    so the decision's own scope shows it, also when that run is closed."""
+    run = next(r for r in records if r.id == before.execution)
+    for ledger in _ledgers(project_root, session):
+        if executions.load_path(ledger, only=run.id):
+            return run, ledger
+    raise ValueError(f"execution {run.id} is in no ledger of this project")
+
+
+def resolve(project_root: str | Path, decision_id: str, evidence: list[str], *,
+            session: str | None = None, now: str | None = None) -> Decision:
+    """Close any open assumption of the project with evidence the open run may cite.
+    Evidence that is refused writes nothing: the decision stays as it was and the
+    refusal codes come back on the result."""
+    run, ledger, records = _open_run(project_root, session)
+    before = _existing(records, decision_id)
+    _well_formed(evidence)
+    reasons = _reasons(records, run, evidence, now, live=live_tools(project_root))
+    if not evidence:
+        reasons.append("no-evidence")
+    if reasons:
+        executions.event(project_root, run.id, ledger=ledger, kind="noted", tool=TOOL,
+                         ref=decision_id, body="resolve refused", reasons=reasons,
+                         session=session, source="cli")
+        return Decision(**{**before.__dict__, "reasons": tuple(reasons)})
+    owner, owner_ledger = _owner(project_root, session, records, before)
+    return _write(project_root, owner, owner_ledger, decision_id, before.claim, list(evidence), "resolved",
+                  before.check, session=session, agent=before.agent, source="cli", reasons=[])
+
+
+def approve(project_root: str | Path, decision_id: str, *, prompt_excerpt: str,
+            session: str | None = None, records: list[executions.Record] | None = None
+            ) -> Decision:
+    """The user said yes. Only the prompt hook calls this, and it names one id of the
+    project; the excerpt is kept as the decision's check. `records`, when the caller
+    already read them."""
+    _, _, records = _open_run(project_root, session, records)
+    before = _existing(records, decision_id)
+    owner, owner_ledger = _owner(project_root, session, records, before)
+    return _write(project_root, owner, owner_ledger, decision_id, before.claim, list(before.evidence),
+                  "approved", prompt_excerpt, session=session, agent=before.agent, source="hook",
+                  reasons=[])
+
+
+def for_scope(project_root: str | Path, *, work_item: str | None, execution: str | None,
+              session: str | None = None, records: list[executions.Record] | None = None
+              ) -> list[Decision]:
+    """The decisions of a work item or run; `records` when the caller already read them."""
+    if records is None:
+        records = all_records(project_root, session)
+    return _fold(records, work_item, execution)
+
+
+def all_open(records: list[executions.Record]) -> list[Decision]:
+    """Every open assumption in these records, whatever run or work item holds it."""
+    return [d for d in _fold(records, None, None, every=True) if d.state == "assumption"]
+
+
+def open_assumptions(project_root: str | Path, *, work_item: str | None, execution: str | None,
+                     session: str | None = None, records: list[executions.Record] | None = None
+                     ) -> list[Decision]:
+    return [d for d in for_scope(project_root, work_item=work_item, execution=execution,
+                                 session=session, records=records)
+            if d.state == "assumption"]
