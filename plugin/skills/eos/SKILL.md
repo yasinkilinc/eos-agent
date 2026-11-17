@@ -3,7 +3,7 @@ name: eos
 description: Load when a question needs project-wide facts EOS already indexed — where a symbol lives, what a file affects, what earlier sessions learned — and you want to weigh an EOS tool against a plain Read or Grep before reaching for either.
 ---
 
-# EOS (engine 2.9.0)
+# EOS (engine 2.10.0)
 
 EOS indexes this project into `.eos/data/eos.db`: parsed symbols, imports, a
 project graph, git history, and notes an agent chose to record. It is
@@ -66,6 +66,7 @@ argument. Every command takes `--format json`.
 | `eos work list [--across]` | Every item in flight, who holds it, what is stale or contested; `--across` covers sibling projects sharing one knowledge root | When picking up work, and before starting something someone may already hold |
 | `eos work add --title "…" --claim` | Records that you took this, so a parallel session sees it | The moment you start, not the moment you finish |
 | `eos work show <id>` | One item's whole history, and the commits naming its ticket | When a claim looks stale, or done and unproven |
+| `eos sessions` / `eos msg send --to <name\|item\|ticket> "…"` | Which sessions run on this machine and on what; a message to exactly one of them, delivered on its next prompt framed as data, never a broadcast. An unknown or ambiguous target is refused with the candidates | When told to pass something to "the other session": never message several sessions; ambiguous, ask which one |
 | `eos run start --title "…"` / `eos run finish --outcome ok\|failed\|abandoned` | Opens and closes an execution: the record of what this session *did*, which wrappers fill with events on their own (`eos run event`, or `eos-event` from a shell). A `failed` finish needs `--lesson "…"` and writes it as a `lesson` note linked to the run; `eos verify` inside an open run lands on its timeline | Start before the first action of a task you will be asked about later; finish when it is done or given up |
 | `eos decide --claim "…" [--evidence ID …] [--check CMD]` / `eos decide --resolve D-ID --evidence ID …` / `eos decide --open` | Records a decision in the open run with the ledger event ids that back it: `evidenced` when every id is a recorded tool event of this work item, otherwise `assumption` with one `reason=` line per refusal; `--resolve` closes an assumption (exit 3 while it stays one); `--open` lists the open ones. Approval is the user's alone and has no flag | When you act on a claim you did not just observe, or must tell the user what you assumed |
 | `eos why-did [path] <run-id\|work-item-id\|ticket-key> [--grep WORDS]` | Lists the decisions of that run, work item or ticket in time order, each with the ledger events cited as evidence and whether the raw output they fingerprinted is still there (`present (sha ok)`, `present (sha differs)`, `gone`, `-`); read-only | When asked "why did you do that", or before repeating a past decision |

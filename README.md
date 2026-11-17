@@ -304,6 +304,9 @@ eos ai update . --claude plugin                # drop the per-project copies
 | `eos parent <path> <symbol> [--limit N]` | Real source for a symbol from a linked parent, inlined |
 | `eos note add\|list\|show\|related\|graph\|search\|move-generated\|eval\|skip\|amend\|audit <path> ...` | Manage authored knowledge notes (see below) |
 | `eos work add\|claim\|log\|block\|unblock\|done\|drop\|list\|show\|stats\|parked <path> ...` | What sessions are working on here, and what came of it (see below) |
+| `eos sessions [--all]` | The sessions running on this machine: name, agent, project, branch, work item, last seen, unread mail |
+| `eos session name <name>` / `eos session show <target>` | Name this session (a live session's name is refused); one session and its inbox headers |
+| `eos msg send --to <target> <body>` / `eos msg inbox [--all]` / `eos msg reply <id> <body>` | Mail to exactly one live session, never a broadcast; the sender is the session variable only |
 | `eos run start\|event\|finish\|list\|tools\|diff\|show <path> ...` | What a session did: executions and their events (ADR-022) |
 | `eos procedure list\|show\|new\|lint\|audit <path> ...` | How a recurring task is done here, and how it has gone (ADR-023) |
 | `eos decide <path> (--claim C \| --resolve D-ID \| --open) [--evidence ID] [--check CHECK]` | Record a decision with its evidence, resolve an assumption, list open ones (ADR-037) |

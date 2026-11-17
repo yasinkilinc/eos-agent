@@ -7,7 +7,40 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from core.cli.common import _hours, _no_work_here, _record_work, _resolve_work, _split_csv, _work_line
+
+
+def _point_session_at(args: argparse.Namespace, item_id: str, title: str,
+                      ticket: str | None = None) -> None:
+    """Tell the session registry which item this session claimed, so another
+    session can address it by that item or its ticket. The ledger already holds
+    the claim: nothing the registry does may change the work command's result."""
+    try:
+        from core import sessions, telemetry
+
+        session = args.session or telemetry.detect_session(args.path)[0]
+        if session:
+            sessions.set_work_item(
+                session, item_id, title, str(Path(args.path).expanduser().resolve()),
+                ticket=ticket,
+            )
+    except Exception:
+        return
+
+
+def _unpoint_session(args: argparse.Namespace) -> None:
+    """After a done or drop, take this session's registry record off the item, so
+    the closed item no longer addresses it. Never fails the work command."""
+    try:
+        from core import sessions, telemetry, work
+
+        session = args.session or telemetry.detect_session(args.path)[0]
+        if session:
+            item = work.resolve(work.fold(work.load(args.path)), args.item)
+            sessions.clear_work_item(session, item.id)
+    except Exception:
+        return
 
 
 def cmd_work_add(args: argparse.Namespace) -> int:
@@ -25,11 +58,26 @@ def cmd_work_add(args: argparse.Namespace) -> int:
     state = work.sync_state(args.path)
     print(f"{entry.id}\t{'claimed' if args.claim else 'open'}\t{args.title}")
     print(work.sync_sentence(state))
+    if args.claim:
+        _point_session_at(args, entry.id, entry.title, args.ticket)
     return 0
 
 
 def cmd_work_claim(args: argparse.Namespace) -> int:
-    return _record_work(args, "claim", body=args.note)
+    code = _record_work(args, "claim", body=args.note)
+    if code == 0:
+        _point_session_at_claimed(args)
+    return code
+
+
+def _point_session_at_claimed(args: argparse.Namespace) -> None:
+    from core import work
+
+    try:
+        item = work.resolve(work.fold(work.load(args.path)), args.item)
+    except Exception:
+        return
+    _point_session_at(args, item.id, item.title, item.ticket)
 
 
 def cmd_work_log(args: argparse.Namespace) -> int:
@@ -61,11 +109,17 @@ def cmd_work_unblock(args: argparse.Namespace) -> int:
 
 
 def cmd_work_done(args: argparse.Namespace) -> int:
-    return _record_work(args, "done", body=args.note)
+    code = _record_work(args, "done", body=args.note)
+    if code == 0:
+        _unpoint_session(args)
+    return code
 
 
 def cmd_work_drop(args: argparse.Namespace) -> int:
-    return _record_work(args, "drop", body=args.reason)
+    code = _record_work(args, "drop", body=args.reason)
+    if code == 0:
+        _unpoint_session(args)
+    return code
 
 
 def cmd_work_list(args: argparse.Namespace) -> int:

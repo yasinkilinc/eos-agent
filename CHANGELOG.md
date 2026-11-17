@@ -2,6 +2,29 @@
 
 Every EOS release, newest first.
 
+## What changed in 2.10.0
+
+- **Sessions on one machine know of each other.** The hooks keep a registry under the
+  state directory (`sessions/registry/`): each Claude Code or Devin session's name (the
+  harness's display name, else `<agent>-<short id>`), agent, project, branch, the work item
+  it claimed and when it was last seen. `eos sessions [--all]` lists them, `eos session
+  name|show` names one or shows it. Live means not ended and seen within 2 hours
+  (`EOS_SESSIONS_LIVE_HOURS`); ended or stale records are pruned after 14 days.
+- **A message reaches exactly one session.** `eos msg send --to <target> "…" [--file F]
+  [--reply-to ID] [--log]` resolves the target among live sessions by name, then by the
+  work item id or ticket one session holds, then by session id; none, several or oneself is
+  refused with the candidates. There is no broadcast form. The sender is the session
+  variable only; without one the send is refused. `eos msg inbox [--all]`, `eos msg reply`.
+- **Mail is delivered by the hooks**, on session start, prompt and (Claude Code) tool calls,
+  framed as data from another session, within the hook's text limit; a cut message names
+  `eos msg inbox --all`. Devin gets mail on session start and prompt until its tool-call
+  output is shown to reach the agent. Subagent hook calls neither register nor take mail.
+- **Work claims point the registry at the item.** `eos work claim` and `eos work add --claim`
+  record the item (and its ticket and ledger) on the session; `done` and `drop` clear it. A
+  message addressed through a work item, or sent with `--log`, is also logged on that item in
+  the ledger it was claimed in.
+- `EOS_SESSIONS=off` turns registration and delivery off.
+
 ## What changed in 2.9.0
 
 - **Gate and evidence tools are configuration.** Which tools clear `red-first`

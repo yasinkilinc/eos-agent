@@ -135,6 +135,29 @@ STOP_REASON_CHARS = 8000
 # brief, up to WORKSPACE_LIVE_LIMIT project briefs and the host's block had no
 # total between them.
 SESSION_TOTAL_CHARS = 9000
+# The session registry and mailbox (`core/sessions.py`, `core/mail.py`): the
+# events that register, refresh or end a session and hand it its mail, each with
+# the harness's name for it when the payload carries none.
+COORDINATED = {"session-start": "SessionStart", "user-prompt": "UserPromptSubmit",
+               "post-tool": "PostToolUse", "session-end": "SessionEnd"}
+# Mail shares the context text field with the brief, which the harness shows in
+# full only up to 10,000 chars: mail gets what the brief left (less a margin for
+# the separator and JSON escapes); under MAIL_MIN_CHARS left it waits for a later
+# hook. A message cut short says so and names `eos msg inbox --all`.
+HOOK_TEXT_CHARS = 10_000
+MAIL_MARGIN_CHARS = 100
+MAIL_MIN_CHARS = 500
+# The events at which Devin is handed its mail. Whether Devin's post-tool output
+# reaches the agent is unproven until the Devin probe shows it; until then
+# post-tool only refreshes the record. The probe lifts this by adding "post-tool".
+DEVIN_MAIL_EVENTS = frozenset({"session-start", "user-prompt"})
+# The branch a registry record shows: one `git rev-parse`, only when the record
+# is written, never allowed to hold a prompt up.
+SESSION_GIT_TIMEOUT = 1
+# The registry lock is one for every session on the machine, and hooks run on
+# 2-10 s budgets: a hook waits this long for it (or a session's mail lock), then
+# skips that call's coordination -- the next hook tries again.
+SESSION_LOCK_TIMEOUT = 1.0
 # A session's injection state (notes given, budget spent, task words) survives
 # SessionEnd for a resume; SessionEnd removes what no session touched this long.
 INJECT_STATE_DAYS = 14
@@ -352,6 +375,16 @@ def _main(argv: list[str] | None) -> int:
                 _probe(root, event, payload, hook)
             if handler is not None:
                 output = handler(root, hook, cfg, agent) or ""
+        if event in COORDINATED and hook.session and not hook.agent_id:
+            try:
+                from core import sessions
+
+                if sessions.enabled():
+                    text = _coordinate(event, hook, root, agent, cap=_mail_room(event, hook, output))
+                    if text:
+                        output = _with_mail(output, hook.event or COORDINATED[event], text)
+            except Exception:  # noqa: BLE001 - mail never costs the session the handler's output
+                pass
         if hook.host == DEVIN:
             output, blocked = _devin_block(output)
     except Exception:  # noqa: BLE001 - a hook never disturbs the session it serves
@@ -534,6 +567,110 @@ def _telemetry(root: Path, event: str, started: float, chars: int, session: str)
 def _context(event_name: str, text: str) -> str:
     return json.dumps({"hookSpecificOutput": {"hookEventName": event_name,
                                               "additionalContext": text}}, ensure_ascii=False)
+
+
+# --- session registry and mail (core/sessions.py, core/mail.py) ----------------------
+
+
+def _mail_room(event: str, hook: Hook, output: str) -> int | None:
+    """The characters this call's mail may take, or None when it takes none: a
+    Devin event outside DEVIN_MAIL_EVENTS, or a context the handler already
+    filled to within MAIL_MIN_CHARS of what the harness shows."""
+    if hook.host == DEVIN and event not in DEVIN_MAIL_EVENTS:
+        return None
+    room = HOOK_TEXT_CHARS - _context_chars(output) - MAIL_MARGIN_CHARS
+    return room if room >= MAIL_MIN_CHARS else None
+
+
+def _context_chars(output: str) -> int:
+    """What of `output` mail would share the 10,000-char field with: plain text
+    whole, a JSON's `additionalContext` only -- not a rewritten tool output, which
+    is no part of that field."""
+    if not output.strip():
+        return 0
+    try:
+        data = json.loads(output)
+    except ValueError:
+        return len(output)
+    if not isinstance(data, dict):
+        return len(output)
+    specific = data.get("hookSpecificOutput")
+    context = specific.get("additionalContext") if isinstance(specific, dict) else None
+    return len(context) if isinstance(context, str) else 0
+
+
+def _coordinate(event: str, hook: Hook, root: Path | None, agent: str | None, *,
+                cap: int | None) -> str:
+    """Keep this session's registry record current and take its waiting mail:
+    the framed text to inject, or "". Runs with or without a project root;
+    `cap` None leaves the mail waiting for a later hook.
+
+    `session-start` (any source, a resume too) registers, which brings an ended
+    record back; a prompt or a tool call only refreshes, and registers a session
+    started before the registry existed. Claude Code may write the session's
+    display name only after SessionStart, so a prompt adopts it while the record
+    still carries the fallback name."""
+    from core import mail, sessions
+
+    if event == "session-end":
+        sessions.end(hook.session, timeout=SESSION_LOCK_TIMEOUT)
+        return ""
+    agent = agent or "claude"
+    cwd = hook.cwd or os.getcwd()
+    record = None if event == "session-start" else sessions.load(hook.session)
+    if record is None:
+        if event == "session-start":
+            sessions.prune(timeout=SESSION_LOCK_TIMEOUT)
+        display = sessions.claude_display_name(hook.session) if agent == "claude" else None
+        sessions.register(hook.session, agent=agent, host=hook.host, cwd=cwd,
+                          project_root=str(root) if root else None, branch=_session_branch(cwd),
+                          display_name=display, timeout=SESSION_LOCK_TIMEOUT)
+    else:
+        if sessions.touch_due(record):
+            sessions.touch(hook.session, cwd=cwd, branch=_session_branch(cwd), timeout=SESSION_LOCK_TIMEOUT)
+        if event == "user-prompt" and record.agent == "claude" and sessions.is_fallback_name(record):
+            display = sessions.claude_display_name(hook.session)
+            if display:
+                sessions.adopt_display_name(hook.session, display, timeout=SESSION_LOCK_TIMEOUT)
+    if cap is None:
+        return ""
+    return mail.delivery_text(hook.session, cap=cap, timeout=SESSION_LOCK_TIMEOUT)
+
+
+def _session_branch(cwd: str) -> str | None:
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        result = subprocess.run([git, "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=SESSION_GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (result.stdout.strip() or None) if result.returncode == 0 else None
+
+
+def _with_mail(output: str, event_name: str, text: str) -> str:
+    """`output` with `text` added to what the model reads, whatever its shape:
+    nothing, plain text, a context JSON, or another JSON (a permission decision,
+    a clipped tool output) that keeps every field it had."""
+    if not output.strip():
+        return _context(event_name, text)
+    try:
+        data = json.loads(output)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return output.rstrip("\n") + "\n\n" + text
+    specific = data.get("hookSpecificOutput")
+    if not isinstance(specific, dict):
+        specific = data["hookSpecificOutput"] = {}
+    specific.setdefault("hookEventName", event_name)
+    before = specific.get("additionalContext")
+    specific["additionalContext"] = f"{before}\n\n{text}" if isinstance(before, str) and before else text
+    return json.dumps(data, ensure_ascii=False)
 
 
 # --- per-session state: append-only, folded on read ----------------------------------

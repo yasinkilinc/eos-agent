@@ -70,6 +70,7 @@ from core.cli.project import cmd_ai, cmd_bench, cmd_clean, cmd_compose, cmd_cont
 from core.cli.route import cmd_capabilities, cmd_route  # noqa: F401
 from core.cli.report import cmd_report  # noqa: F401
 from core.cli.runs import cmd_run  # noqa: F401
+from core.cli.sessions import cmd_msg, cmd_session, cmd_sessions  # noqa: F401
 from core.cli.whydid import cmd_whydid  # noqa: F401
 from core.cli.work import cmd_work  # noqa: F401
 
@@ -730,6 +731,32 @@ def main(argv: list[str] | None = None) -> int:
     add_path(work_parked_p)
     work_parked_p.add_argument("--format", choices=("text", "json"), default="text")
 
+    sessions_p = sub.add_parser("sessions", help="The sessions running on this machine")
+    sessions_p.add_argument("--all", action="store_true", help="Also ended and stale sessions")
+
+    session_p = sub.add_parser("session", help="Name this session, or show one")
+    session_sub = session_p.add_subparsers(dest="session_command", required=True)
+    session_name_p = session_sub.add_parser("name", help="Name this session; a live session's name is refused")
+    session_name_p.add_argument("name")
+    session_show_p = session_sub.add_parser("show", help="One session and its recent inbox headers")
+    session_show_p.add_argument("target", help="Session name, work item id or key, or session id (prefix)")
+
+    msg_p = sub.add_parser("msg", help="Messages between sessions, one recipient at a time")
+    msg_sub = msg_p.add_subparsers(dest="msg_command", required=True)
+    msg_send_p = msg_sub.add_parser("send", help="Send to exactly one live session")
+    msg_send_p.add_argument("--to", required=True,
+                            help="Session name, work item id or key, or session id (prefix)")
+    msg_send_p.add_argument("--file", default=None, help="Attach a copy of this file")
+    msg_send_p.add_argument("--reply-to", dest="reply_to", default=None, help="Id of the message this answers")
+    msg_send_p.add_argument("--log", action="store_true",
+                            help="Also log the message on the recipient's work item in its project ledger")
+    msg_send_p.add_argument("body")
+    msg_inbox_p = msg_sub.add_parser("inbox", help="This session's unread messages")
+    msg_inbox_p.add_argument("--all", action="store_true", help="Also the ones already delivered")
+    msg_reply_p = msg_sub.add_parser("reply", help="Answer a message in this session's inbox")
+    msg_reply_p.add_argument("id", help="Message id")
+    msg_reply_p.add_argument("body")
+
     ai_p = sub.add_parser("ai", help="Manage the AI integration files")
     ai_sub = ai_p.add_subparsers(dest="ai_command", required=True)
     ai_update_p = ai_sub.add_parser("update", help="Refresh the integration files for this EOS version")
@@ -799,6 +826,9 @@ def main(argv: list[str] | None = None) -> int:
         "parents": cmd_parents,
         "note": cmd_note,
         "work": cmd_work,
+        "sessions": cmd_sessions,
+        "session": cmd_session,
+        "msg": cmd_msg,
         "decide": cmd_decide,
         "gate": cmd_gate,
         "why-did": cmd_whydid,
