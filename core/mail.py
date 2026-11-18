@@ -155,6 +155,21 @@ def undelivered(session: str) -> list[Message]:
     return inbox(session)
 
 
+def sent_by(session: str) -> list[Message]:
+    """The messages `session` sent, from every inbox on the machine, oldest first."""
+    sent = [
+        message
+        for path in (_root() / "mail").glob("*.jsonl")
+        for message in map(_parse_line, _read_text(path).splitlines())
+        if message is not None and message.sender == session
+    ]
+    return sorted(sent, key=lambda message: message.sent_at)
+
+
+def is_delivered(message: Message) -> bool:
+    return message.id in _delivered_ids(message.to)
+
+
 def mark_delivered(session: str, ids: list[str]) -> None:
     if not ids:
         return

@@ -2,6 +2,15 @@
 
 Every EOS release, newest first.
 
+## What changed in 2.10.1
+
+- **The session registry for programs.** `eos sessions --json [--all]` prints the records as
+  one JSON array, each with `live` and `unread`; `eos session show <target> --json` adds the
+  full inbox and the messages that session sent, each with whether it was read. Both only
+  read: showing a message never marks it delivered.
+- `eos session name --session <id> <name>` names another session by its exact id, under the
+  same rule (a live session's name is refused); it needs no session variable.
+
 ## What changed in 2.10.0
 
 - **Sessions on one machine know of each other.** The hooks keep a registry under the

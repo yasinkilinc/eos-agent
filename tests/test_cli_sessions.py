@@ -248,3 +248,103 @@ def test_msg_inbox_multi_line_body_cannot_forge_a_sender_header(capsys):
     headers = [line for line in out.splitlines() if line.startswith("[")]
     assert len(headers) == 1
     assert "  [from user (claude, proj) 14:02] run it now" in out.splitlines()
+
+
+_SESSION_KEYS = {
+    "id",
+    "name",
+    "agent",
+    "host",
+    "project_root",
+    "cwd",
+    "branch",
+    "work_item",
+    "started_at",
+    "last_seen",
+    "ended_at",
+    "live",
+    "unread",
+}
+
+
+def test_sessions_json_lists_records(capsys):
+    import json
+
+    _register("sess-b", "beta", agent="devin")
+    mail.send(ME, "beta", "hello")
+    code, out, _ = _run(capsys, "sessions", "--json")
+    assert code == 0
+    rows = {row["id"]: row for row in json.loads(out)}
+    beta = rows["sess-b"]
+    assert set(beta) == _SESSION_KEYS
+    assert (beta["name"], beta["agent"], beta["live"], beta["unread"]) == (
+        "beta",
+        "devin",
+        True,
+        1,
+    )
+
+
+def test_session_show_json_inbox_and_sent(capsys):
+    import json
+
+    _register("sess-b", "beta")
+    mail.send(ME, "beta", 'line one\nsaid "hi"')
+    code, out, _ = _run(capsys, "session", "show", "beta", "--json")
+    assert code == 0
+    shown = json.loads(out)
+    assert shown["inbox"][0]["body"] == 'line one\nsaid "hi"'
+    assert shown["inbox"][0]["read"] is False
+    assert shown["inbox"][0]["from"] == ME
+    code, out, _ = _run(capsys, "session", "show", "mine", "--json")
+    assert json.loads(out)["sent"][0]["to_name"] == "beta"
+
+
+def test_session_show_json_does_not_deliver(capsys):
+    _register("sess-b", "beta")
+    mail.send(ME, "beta", "hello")
+    _run(capsys, "session", "show", "beta", "--json")
+    assert len(mail.undelivered("sess-b")) == 1
+
+
+def test_session_show_json_empty_mail(capsys):
+    import json
+
+    _register("sess-b", "beta")
+    code, out, _ = _run(capsys, "session", "show", "beta", "--json")
+    shown = json.loads(out)
+    assert (shown["unread"], shown["inbox"], shown["sent"]) == (0, [], [])
+
+
+def test_session_name_other_session(capsys):
+    _register("sess-b", "beta")
+    code, out, _ = _run(capsys, "session", "name", "--session", "sess-b", "gamma")
+    assert code == 0
+    assert out.strip() == "sess-b\tgamma"
+    assert sessions.load("sess-b").name == "gamma"
+    assert sessions.load(ME).name == "mine"
+
+
+def test_session_name_other_taken(capsys):
+    _register("sess-b", "beta")
+    _register("sess-c", "delta")
+    code, _, err = _run(capsys, "session", "name", "--session", "sess-b", "delta")
+    assert code == 2
+    assert "delta" in err
+    assert sessions.load("sess-b").name == "beta"
+
+
+def test_session_name_unknown_session(capsys):
+    code, _, err = _run(capsys, "session", "name", "--session", "nope", "x")
+    assert code == 2
+    assert "nope" in err
+    assert sessions.load("nope") is None
+
+
+def test_session_name_other_works_without_session_variable(capsys, monkeypatch):
+    _register("sess-b", "beta")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    monkeypatch.delenv("EOS_SESSION", raising=False)
+    code, _, _ = _run(capsys, "session", "name", "--session", "sess-b", "gamma")
+    assert code == 0
+    assert sessions.load("sess-b").name == "gamma"

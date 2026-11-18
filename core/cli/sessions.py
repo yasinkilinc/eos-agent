@@ -9,6 +9,8 @@ it runs in refuses when there is none, rather than guess from the directory.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -84,8 +86,42 @@ def _refuse_resolution(exc: Exception, target: str) -> int | None:
     return None
 
 
+def _record_json(record: sessions.Record, now) -> dict:
+    return {
+        **dataclasses.asdict(record),
+        "live": sessions._is_live(record, now),
+        "unread": len(mail.undelivered(record.id)),
+    }
+
+
+def _message_json(message: mail.Message, *, outgoing: bool) -> dict:
+    if outgoing:
+        recipient = sessions.load(message.to)
+        party = {"to": message.to, "to_name": recipient.name if recipient else None}
+    else:
+        party = {"from": message.sender, "from_name": message.sender_name}
+    return {
+        "id": message.id,
+        **party,
+        "sent_at": message.sent_at,
+        "body": message.body,
+        "attachment": message.attachment,
+        "reply_to": message.reply_to,
+        "read": mail.is_delivered(message),
+    }
+
+
+def _print_json(value) -> None:
+    print(json.dumps(value, ensure_ascii=False))
+
+
 def cmd_sessions(args: argparse.Namespace) -> int:
     records = sessions.all_records() if args.all else sessions.live()
+    if args.json:
+        now = sessions._now()
+        ordered = sorted(records, key=lambda r: r.last_seen, reverse=True)
+        _print_json([_record_json(record, now) for record in ordered])
+        return 0
     rows = [("NAME", "AGENT", "PROJECT", "BRANCH", "WORK", "SEEN", "UNREAD")]
     for record in sorted(records, key=lambda r: r.last_seen, reverse=True):
         rows.append(
@@ -109,7 +145,12 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 
 
 def cmd_session_name(args: argparse.Namespace) -> int:
-    own = _own_session()
+    if args.session is not None:
+        if sessions.load(args.session) is None:
+            return _refuse(f"no session {args.session} in the registry")
+        own = args.session
+    else:
+        own = _own_session()
     if own is None:
         return REFUSED
     try:
@@ -131,6 +172,17 @@ def cmd_session_show(args: argparse.Namespace) -> int:
         record = sessions.resolve(args.target, sender=None)
     except (sessions.NoMatch, sessions.Ambiguous) as exc:
         return _refuse_resolution(exc, args.target)
+    if args.json:
+        shown = _record_json(record, sessions._now())
+        shown["inbox"] = [
+            _message_json(message, outgoing=False)
+            for message in mail.inbox(record.id, include_delivered=True)
+        ]
+        shown["sent"] = [
+            _message_json(message, outgoing=True) for message in mail.sent_by(record.id)
+        ]
+        _print_json(shown)
+        return 0
     for label, value in (
         ("name", record.name),
         ("id", record.id),

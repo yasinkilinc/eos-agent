@@ -191,3 +191,17 @@ def test_send_to_self_or_nobody_writes_nothing(trio):
     with pytest.raises(sessions.NoMatch):
         mail.send("sess-a", "nobody", "x")
     assert not (mail._root() / "mail").exists()
+
+
+def test_sent_by_scans_every_inbox(trio):
+    mail.send("sess-a", "beta", "first")
+    mail.send("sess-a", "gamma", "second")
+    mail.send("sess-b", "gamma", "not mine")
+    assert [m.body for m in mail.sent_by("sess-a")] == ["first", "second"]
+
+
+def test_is_delivered(trio):
+    message, _ = mail.send("sess-a", "beta", "hello")
+    assert mail.is_delivered(message) is False
+    mail.mark_delivered("sess-b", [message.id])
+    assert mail.is_delivered(message) is True

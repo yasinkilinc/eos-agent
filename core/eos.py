@@ -733,13 +733,18 @@ def main(argv: list[str] | None = None) -> int:
 
     sessions_p = sub.add_parser("sessions", help="The sessions running on this machine")
     sessions_p.add_argument("--all", action="store_true", help="Also ended and stale sessions")
+    sessions_p.add_argument("--json", action="store_true", help="One JSON array, for programs")
 
     session_p = sub.add_parser("session", help="Name this session, or show one")
     session_sub = session_p.add_subparsers(dest="session_command", required=True)
     session_name_p = session_sub.add_parser("name", help="Name this session; a live session's name is refused")
+    session_name_p.add_argument("--session", default=None,
+                                help="Name the session with this exact id instead of this one")
     session_name_p.add_argument("name")
     session_show_p = session_sub.add_parser("show", help="One session and its recent inbox headers")
     session_show_p.add_argument("target", help="Session name, work item id or key, or session id (prefix)")
+    session_show_p.add_argument("--json", action="store_true",
+                                help="One JSON object with the full inbox and the sent messages; reads only")
 
     msg_p = sub.add_parser("msg", help="Messages between sessions, one recipient at a time")
     msg_sub = msg_p.add_subparsers(dest="msg_command", required=True)
